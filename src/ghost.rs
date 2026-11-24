@@ -245,6 +245,16 @@ impl Ghost {
         self.composite(live, fresh, board);
     }
 
+    /// The board moved in the camera frame: use a new mask warp and start the memory afresh (the old memory
+    /// is of the board at the old position).
+    pub fn recalibrate(&mut self, mask_map: ResampleMap, seg_scale: f32) {
+        self.mask_map = mask_map;
+        self.seg_r = ((self.p.grow * self.h as f32 * seg_scale).round() as usize).max(1);
+        self.started = false;
+        self.hold.fill(0.0);
+        self.still.fill(0);
+    }
+
     pub fn opacity(&self) -> f32 {
         self.p.opacity
     }

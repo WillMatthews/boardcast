@@ -110,7 +110,25 @@ resolution), `--raw-size WxH`, `--focus auto|N`, `--cam`, `--raw`, `--board`, `-
 ## Calibration (`board.json`)
 
 - `corners`: TL, TR, BR, BL of the writing surface (inner edge of the aluminium frame) in full-resolution
-  (2560×1440) camera pixels. If the camera gets bumped, run `snap`, look at `raw.png`, and fix these.
-  (AprilTag auto-calibration is build step 3.)
+  (2560×1440) camera pixels.
 - `focus`: locked `focus_absolute` (autofocus locks onto my head instead of the board).
 - `aspect`: real board width/height. 0.75 is estimated from the square sticky notes. Measure it to be exact.
+
+**Finding the board.** Along each edge of the current outline, boardvu looks across the edge for the strongest
+step from dark board to bright frame, fits a line per edge with RANSAC (so sticky notes on the edge, a person in
+front of it, or chalk near it are ignored), and intersects the lines for the corners.
+
+```sh
+cargo run --release -- calibrate --dry-run --dir out/   # find the board, write out/calib.png, change nothing
+cargo run --release -- calibrate                        # ...and save the corners to board.json
+cargo run --release -- calibrate --search 250           # the camera moved a lot (default search: 120 px)
+cargo run --release -- calibrate --from "x,y x,y x,y x,y"  # start from a rough guess (TL TR BR BL)
+cargo run --release -- calibrate --set "x,y x,y x,y x,y"   # manual fallback: use exactly these corners
+```
+
+`calib.png` shows the new outline in green and the previous one in orange.
+
+**While streaming** boardvu re-checks the edges every 2 s (average of 8 frames, ±15 px). If three checks in a row
+agree that the board has moved more than 2 px, it re-aligns the warp, restarts the board memory, and saves the
+new corners to `board.json`; the output size doesn't change, so meeting apps don't notice. A bigger move than
+that prints a hint to run `calibrate`. `--no-track` turns this off.

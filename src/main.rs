@@ -1,5 +1,6 @@
 //! boardvu: a webcam pointed at my blackboard -> two v4l2loopback cameras (raw passthrough + deskewed board).
 
+mod calib;
 mod camera;
 mod enhance;
 mod geom;
@@ -40,6 +41,24 @@ enum Cmd {
     Snap {
         #[arg(default_value = ".")]
         dir: PathBuf,
+    },
+    /// Find the board's edges and update the corners in the config (writes calib.png to check).
+    Calibrate {
+        /// Where calib.png goes.
+        #[arg(long, default_value = ".")]
+        dir: PathBuf,
+        /// How far (pixels) the board may have moved from the starting corners.
+        #[arg(long, default_value_t = 120)]
+        search: i32,
+        /// Start from these corners instead of the config's: "x,y x,y x,y x,y" (TL TR BR BL).
+        #[arg(long, value_parser = parse_corners)]
+        from: Option<calib::Corners>,
+        /// Manual fallback: write exactly these corners, no detection.
+        #[arg(long, value_parser = parse_corners, conflicts_with = "from")]
+        set: Option<calib::Corners>,
+        /// Report only; don't write the config.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Debug: time person segmentation on live frames and save the last matte.
     #[command(hide = true)]
@@ -98,6 +117,9 @@ struct RunArgs {
     /// How the board looks (switch while running with the `l` key).
     #[arg(long, value_enum, default_value_t = enhance::Look::Natural)]
     look: enhance::Look,
+    /// Don't watch for the board moving in the frame (a bumped camera).
+    #[arg(long)]
+    no_track: bool,
     /// Plain deskewed board: no segmentation, no board memory, no ghost.
     #[arg(long)]
     no_ghost: bool,
@@ -153,6 +175,33 @@ fn parse_size(s: &str) -> Result<(usize, usize), String> {
         return Err("width and height must be even (4:2:x chroma pairs pixels and rows)".into());
     }
     Ok((w, h))
+}
+
+fn parse_corners(s: &str) -> Result<calib::Corners, String> {
+    let pts: Vec<[f64; 2]> = s
+        .split_whitespace()
+        .map(|p| {
+            let (x, y) = p.split_once(',').ok_or("expected x,y")?;
+            Ok([
+                x.parse().map_err(|_| "bad x")?,
+                y.parse().map_err(|_| "bad y")?,
+            ])
+        })
+        .collect::<Result<_, &str>>()?;
+    pts.try_into()
+        .map_err(|_| "expected 4 corners: \"x,y x,y x,y x,y\" (TL TR BR BL)".into())
+}
+
+/// Replace the corners in the config file, keeping everything else.
+fn save_corners(path: &Path, corners: &calib::Corners) -> Result<()> {
+    let text = std::fs::read_to_string(path)?;
+    let mut v: serde_json::Value = serde_json::from_str(&text)?;
+    let round = |x: f64| (x * 10.0).round() / 10.0;
+    v["corners"] = serde_json::json!(corners.map(|[x, y]| [round(x), round(y)]));
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_string_pretty(&v)? + "\n")?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
 }
 
 fn load_config(path: &Path) -> Result<Config> {
@@ -239,6 +288,16 @@ fn main() -> Result<()> {
         };
         return seg_bench(&mut *source, (fw, fh), dir, *res, *ratio, *threads);
     }
+    if let Some(Cmd::Calibrate {
+        dir,
+        search,
+        from,
+        set,
+        dry_run,
+    }) = &cli.cmd
+    {
+        return calibrate_cmd(&cli.common, &cfg, dir, *search, *from, *set, *dry_run);
+    }
     let mut cam = Camera::open(&cli.common.cam, fw, fh, focus_of(&cli.common, &cfg)?)?;
     eprintln!(
         "camera {} {fw}x{fh}; board {bw}x{bh} in a {cw}x{ch} canvas",
@@ -247,8 +306,15 @@ fn main() -> Result<()> {
 
     match cli.cmd.unwrap_or(Cmd::Run) {
         Cmd::Snap { dir } => snap(&mut cam, &board_map, &cfg, &dir),
-        Cmd::SegBench { .. } => unreachable!("handled above"),
-        Cmd::Run => run(&mut cam, &board_map, &cfg, ((cw, ch), (bw, bh)), &cli.run),
+        Cmd::SegBench { .. } | Cmd::Calibrate { .. } => unreachable!("handled above"),
+        Cmd::Run => run(
+            &mut cam,
+            board_map,
+            &cfg,
+            &cli.common.config,
+            ((cw, ch), (bw, bh)),
+            &cli.run,
+        ),
     }
 }
 
@@ -288,6 +354,76 @@ fn snap(cam: &mut Camera, board_map: &ResampleMap, cfg: &Config, dir: &Path) -> 
         "wrote raw.png, board.png, board_natural.png, board_paper.png to {}",
         dir.display()
     );
+    Ok(())
+}
+
+fn calibrate_cmd(
+    common: &Common,
+    cfg: &Config,
+    dir: &Path,
+    search: i32,
+    from: Option<calib::Corners>,
+    set: Option<calib::Corners>,
+    dry_run: bool,
+) -> Result<()> {
+    let [fw, fh] = cfg.frame;
+    let mut cam = Camera::open(&common.cam, fw, fh, focus_of(common, cfg)?)?;
+    let mut frame = Rgb::new(fw, fh);
+    for _ in 0..30 {
+        cam.next_into(&mut frame)?; // let exposure settle
+    }
+    // Average 8 frames to cut noise.
+    let mut sum = vec![0u32; frame.data.len()];
+    for _ in 0..8 {
+        cam.next_into(&mut frame)?;
+        for (s, &v) in sum.iter_mut().zip(&frame.data) {
+            *s += v as u32;
+        }
+    }
+    for (b, s) in frame.data.iter_mut().zip(&sum) {
+        *b = ((s + 4) / 8) as u8;
+    }
+    let corners = match set {
+        Some(c) => {
+            eprintln!("using the given corners as-is");
+            c
+        }
+        None => {
+            let start = from.unwrap_or(cfg.corners);
+            let fit = calib::calibrate(&frame, &start, search)
+                .context("couldn't find all four board edges near the starting corners (try --search or --from)")?;
+            eprintln!(
+                "found the board {:.1} px from the starting corners; edge support (top, right, bottom, left) {:?}",
+                calib::max_shift(&fit.corners, &start),
+                fit.support.map(|s| (s * 100.0).round() / 100.0)
+            );
+            if fit.min_support() < 0.35 {
+                eprintln!(
+                    "warning: an edge is poorly supported; check calib.png before trusting this"
+                );
+            }
+            fit.corners
+        }
+    };
+    let fmt: Vec<String> = corners
+        .iter()
+        .map(|[x, y]| format!("{x:.1},{y:.1}"))
+        .collect();
+    eprintln!("corners (TL TR BR BL): {}", fmt.join(" "));
+    std::fs::create_dir_all(dir)?;
+    draw_quad(&mut frame, &cfg.corners, [255, 160, 0]);
+    draw_quad(&mut frame, &corners, [0, 255, 0]);
+    write_png(&dir.join("calib.png"), &frame)?;
+    eprintln!(
+        "wrote {}/calib.png (green: new, orange: previous)",
+        dir.display()
+    );
+    if dry_run {
+        eprintln!("dry run: {} not changed", common.config.display());
+    } else {
+        save_corners(&common.config, &corners)?;
+        eprintln!("updated {}", common.config.display());
+    }
     Ok(())
 }
 
@@ -334,13 +470,30 @@ fn seg_bench(
     Ok(())
 }
 
+/// Segmentation-frame -> board-canvas warp for the ghost's matte, and segmentation pixels per board pixel.
+fn mask_map_for(
+    corners: &calib::Corners,
+    (cam_w, cam_h): (usize, usize),
+    (sw, sh): (usize, usize),
+    ((cw, ch), (bw, bh)): ((usize, usize), (usize, usize)),
+) -> Result<(ResampleMap, f32)> {
+    let (kx, ky) = (sw as f64 / cam_w as f64, sh as f64 / cam_h as f64);
+    let c = corners.map(|[x, y]| [x * kx, y * ky]);
+    let map = ResampleMap::board(&c, sw, sh, cw, ch, bw, bh, [0; 3])?;
+    // Along the board's longer (nearer) vertical edge.
+    let scale = (dist(c[0], c[3]).max(dist(c[1], c[2])) / bh as f64) as f32;
+    Ok((map, scale))
+}
+
 fn run(
     cam: &mut Camera,
-    board_map: &ResampleMap,
+    mut board_map: ResampleMap,
     cfg: &Config,
-    ((cw, ch), (bw, bh)): ((usize, usize), (usize, usize)),
+    config_path: &Path,
+    dims: ((usize, usize), (usize, usize)),
     args: &RunArgs,
 ) -> Result<()> {
+    let ((cw, ch), (bw, bh)) = dims;
     // Light first, so the camera's auto-exposure settles on the lit board. Dropped (light off) on any exit.
     let _light = if args.no_light {
         None
@@ -359,12 +512,7 @@ fn run(
             args.seg_threads,
             args.seg_fps,
         )?;
-        let (kx, ky) = (sw as f64 / cam.w as f64, sh as f64 / cam.h as f64);
-        let corners = cfg.corners.map(|[x, y]| [x * kx, y * ky]);
-        let mask_map = ResampleMap::board(&corners, sw, sh, cw, ch, bw, bh, [0; 3])?;
-        // Segmentation pixels per board pixel, along the board's longer (nearer) vertical edge.
-        let seg_scale =
-            (dist(corners[0], corners[3]).max(dist(corners[1], corners[2])) / bh as f64) as f32;
+        let (mask_map, seg_scale) = mask_map_for(&cfg.corners, (cam.w, cam.h), (sw, sh), dims)?;
         let params = ghost::GhostParams {
             opacity: args.ghost_opacity,
             ..Default::default()
@@ -403,6 +551,7 @@ fn run(
     let s = stop.clone();
     ctrlc::set_handler(move || s.store(true, Ordering::SeqCst))?;
 
+    let mut tracker = (!args.no_track).then(|| calib::Tracker::new(cfg.corners));
     let mut frame = Rgb::new(cam.w, cam.h);
     let mut board = Rgb::new(board_map.out_w, board_map.out_h);
     let mut enhancer = enhance::Enhancer::new(args.look, board.w, board.h);
@@ -427,6 +576,7 @@ fn run(
         let t0 = Instant::now();
         match cam.next_into(&mut frame) {
             Ok(()) => errors = 0,
+            Err(_) if stop.load(Ordering::SeqCst) => break, // Ctrl-C interrupted the read
             Err(e) => {
                 // A corrupt MJPEG frame now and then is normal; a run of them means the camera has gone.
                 errors += 1;
@@ -438,6 +588,23 @@ fn run(
             }
         }
         let t1 = Instant::now();
+        if let Some(c) = tracker.as_mut().and_then(|t| t.check(&frame)) {
+            eprintln!(
+                "board moved in the frame: re-aligned (corners {})",
+                c.iter()
+                    .map(|[x, y]| format!("{x:.1},{y:.1}"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+            board_map = ResampleMap::board(&c, cam.w, cam.h, cw, ch, bw, bh, BG)?;
+            if let Some((_, g, _)) = &mut ghost {
+                let (map, scale) = mask_map_for(&c, (cam.w, cam.h), args.seg_res, dims)?;
+                g.recalibrate(map, scale);
+            }
+            if let Err(e) = save_corners(config_path, &c) {
+                eprintln!("warning: couldn't save the new corners: {e:#}");
+            }
+        }
         board_map.apply(&frame, &mut board);
         if args.test_flash {
             board.data.fill(if n % 2 == 0 { 0 } else { 255 });
