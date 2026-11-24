@@ -8,6 +8,7 @@ use crate::geom::Homography;
 pub const ROWS_PER_TASK: usize = 16;
 
 /// Packed 8-bit RGB image.
+#[derive(Clone)]
 pub struct Rgb {
     pub w: usize,
     pub h: usize,

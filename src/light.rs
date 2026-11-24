@@ -36,8 +36,8 @@ impl Light {
         };
         let cfg: LightConfig =
             serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
-        let token =
-            token().ok_or_else(|| anyhow!("no HA_API_KEY in the environment or ~/.tokens"))?;
+        let token = crate::secrets::token("HA_API_KEY")
+            .ok_or_else(|| anyhow!("no HA_API_KEY in the environment or ~/.tokens"))?;
         let agent = ureq::Agent::config_builder()
             .timeout_global(Some(Duration::from_secs(8)))
             .build()
@@ -92,39 +92,5 @@ impl Drop for LightGuard {
             Ok(()) => eprintln!("board light off"),
             Err(e) => eprintln!("warning: {e:#}"),
         }
-    }
-}
-
-fn token() -> Option<String> {
-    if let Ok(t) = std::env::var("HA_API_KEY") {
-        if !t.is_empty() {
-            return Some(t);
-        }
-    }
-    let home = std::env::var_os("HOME")?;
-    let text = std::fs::read_to_string(Path::new(&home).join(".tokens")).ok()?;
-    text.lines().find_map(parse_token_line)
-}
-
-/// `HA_API_KEY=abc`, `export HA_API_KEY="abc"` -> abc
-fn parse_token_line(line: &str) -> Option<String> {
-    let line = line.trim_start();
-    let line = line.strip_prefix("export ").unwrap_or(line).trim_start();
-    let v = line.strip_prefix("HA_API_KEY=")?;
-    let v = v.trim().trim_matches(|c| c == '"' || c == '\'');
-    (!v.is_empty()).then(|| v.to_string())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::parse_token_line as p;
-
-    #[test]
-    fn token_lines() {
-        assert_eq!(p("HA_API_KEY=abc").as_deref(), Some("abc"));
-        assert_eq!(p("export HA_API_KEY=\"abc\"").as_deref(), Some("abc"));
-        assert_eq!(p("  export HA_API_KEY='abc'  ").as_deref(), Some("abc"));
-        assert_eq!(p("OTHER_KEY=abc"), None);
-        assert_eq!(p("HA_API_KEY="), None);
     }
 }
