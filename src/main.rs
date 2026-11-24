@@ -10,8 +10,10 @@ mod keys;
 mod light;
 mod log;
 mod pip;
+mod pose;
 mod secrets;
 mod segment;
+mod track;
 mod tui;
 
 use std::path::{Path, PathBuf};
@@ -157,6 +159,9 @@ struct RunArgs {
     /// Start with the picture-in-picture of me showing (toggle with `p`; needs ghost mode's segmentation).
     #[arg(long)]
     pip: bool,
+    /// Pose model for finding my head in the picture-in-picture (YOLO pose, ONNX).
+    #[arg(long, default_value = concat!(env!("CARGO_MANIFEST_DIR"), "/models/yolo11n-pose.onnx"))]
+    pose_model: PathBuf,
     /// Picture-in-picture size, as a fraction of the feed's width.
     #[arg(long, default_value_t = 0.3)]
     pip_size: f32,
@@ -558,7 +563,14 @@ fn run(
             args.seg_ratio,
             args.seg_threads,
             args.seg_fps,
+            Some(args.pose_model.as_path()).filter(|p| p.exists()),
         )?;
+        if !args.pose_model.exists() {
+            say!(
+                "no pose model ({}): picture-in-picture follows the matte instead (scripts/fetch-pose-model.sh)",
+                args.pose_model.display()
+            );
+        }
         let (mask_map, seg_scale) =
             mask_map_for(&cfg.corners, (cam.w, cam.h), cfg.rotate, (sw, sh), dims)?;
         let params = ghost::GhostParams {
@@ -717,6 +729,12 @@ fn run(
                     last_enhance = Instant::now();
                 }
                 g.overlay(&enhanced, &board, out);
+                seg.set_pose(pip.on);
+                let up = image::upright_size((cam.w, cam.h), cfg.rotate);
+                let person = seg.person();
+                if let Some((version, person)) = person {
+                    pip.track_head(version, person.head, (seg.w, seg.h), up);
+                }
                 let (m, mw, mh, version) = g.matte();
                 pip.track(
                     m,

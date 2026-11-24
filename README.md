@@ -45,8 +45,14 @@ then exits. Reload the module with `scripts/loopback.sh`.
 ## Setup: the segmentation model (once)
 
 ```sh
-scripts/fetch-model.sh   # models/rvm_mobilenetv3_fp32.onnx, Robust Video Matting (GPL-3.0)
+scripts/fetch-model.sh       # models/rvm_mobilenetv3_fp32.onnx, Robust Video Matting (GPL-3.0)
+scripts/fetch-pose-model.sh  # models/yolo11n-pose.onnx, for the picture-in-picture (optional; needs uv)
 ```
+
+The pose model (Ultralytics YOLO11n-pose, AGPL-3.0, so not committed here) finds my head for the
+picture-in-picture: from my face, or from my ears and shoulders when I have my back to the camera, and raised arms
+don't fool it. It runs only while the picture-in-picture is on (~25 ms per segmented frame). Without it, the
+picture-in-picture follows the top of the person matte.
 
 ## Setup: board light (optional)
 
@@ -79,7 +85,7 @@ prints plain log lines instead.
 shown, no ghosting). `p` toggles a picture-in-picture of me, `o` moves it to the next corner. `q`, Esc or Ctrl-C stops.
 
 **Picture-in-picture.** A squircle crop of me, inset in a corner of the board feed (same resolution, so meeting
-apps don't notice it coming and going). It follows my head using ghost mode's person matte (so it needs ghost
+apps don't notice it coming and going). It follows my head (found by the pose model, or the person matte; either way it needs ghost
 mode), framed about three head-widths wide so it looks the same at the board or at the desk, and fades out when I
 leave the frame. `--pip` starts with it on; `--pip-size` (fraction of the feed's width, default 0.3) and
 `--pip-corner` set it up.

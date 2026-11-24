@@ -9,6 +9,7 @@ use std::time::Instant;
 use rayon::prelude::*;
 
 use crate::image::{Rgb, from_upright, upright_size};
+use crate::track::Kalman;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, clap::ValueEnum)]
 pub enum Corner {
@@ -52,6 +53,11 @@ pub struct Pip {
     last: Instant,
     /// Version of the matte the crop was last updated from (update once per new matte).
     matte_seen: u64,
+    /// Pose results: the last one used, when pose last found me, and the last head width it measured (in upright
+    /// camera pixels) for frames where it can't tell.
+    head_seen: u64,
+    pose_found: Option<Instant>,
+    head_width: Option<f32>,
     patch: Rgb,
     /// Where the inset is drawn (top-left, canvas pixels) and how fast it's moving: it glides between corners.
     at: Option<[f32; 2]>,
@@ -70,6 +76,9 @@ impl Pip {
             seen: None,
             last: Instant::now(),
             matte_seen: u64::MAX,
+            head_seen: u64::MAX,
+            pose_found: None,
+            head_width: None,
             patch: Rgb::new(1, 1),
             at: None,
             at_v: [0.0; 2],
@@ -90,6 +99,13 @@ impl Pip {
             return;
         }
         self.matte_seen = version;
+        // Pose is better at finding my head (raised arms don't fool it); the matte is the fallback.
+        if self
+            .pose_found
+            .is_some_and(|t| t.elapsed().as_secs_f32() < 0.6)
+        {
+            return;
+        }
         let Some([cx, top, hw]) = find_head(matte, mw, mh) else {
             return;
         };
@@ -99,6 +115,39 @@ impl Pip {
         let target = [cx * k, top * k - HEAD_TOP * side + side / 2.0, side];
         self.seen = Some(Instant::now());
         self.measured = Some(target);
+    }
+
+    /// Follow my head as found by pose (`head` in the `seg` frame's pixels, `version` changes with each run).
+    pub fn track_head(
+        &mut self,
+        version: u64,
+        head: Option<crate::pose::Head>,
+        seg: (usize, usize),
+        upright: (usize, usize),
+    ) {
+        if version == self.head_seen {
+            return;
+        }
+        self.head_seen = version;
+        let Some(h) = head else { return };
+        let k = upright.0 as f32 / seg.0 as f32;
+        if let Some(w) = h.width {
+            self.head_width = Some(w * k);
+        }
+        let Some(hw) = self.head_width else { return };
+        let side =
+            (hw * HEAD_WIDTHS).clamp(upright.0 as f32 * 0.12, upright.0.min(upright.1) as f32);
+        // Eye level is about 0.55 head widths below the top of the head.
+        let top = h.y * k - 0.55 * hw;
+        self.pose_found = Some(Instant::now());
+        self.seen = Some(Instant::now());
+        self.measured = Some([h.x * k, top - HEAD_TOP * side + side / 2.0, side]);
+    }
+
+    /// Whether pose is currently finding me (for the status display).
+    pub fn using_pose(&self) -> bool {
+        self.pose_found
+            .is_some_and(|t| t.elapsed().as_secs_f32() < 0.6)
     }
 
     /// Draw the inset onto `out`, cropping from the camera `frame` (turned `rot` to upright).
@@ -149,33 +198,73 @@ impl Pip {
         // Each inset pixel covers k x k camera pixels: average an n x n grid of samples over that footprint
         // (one sample per camera pixel or so), or fine detail aliases and shimmers as the crop glides.
         let k = side / p as f32;
-        let n = (k.ceil() as usize).clamp(1, 8);
-        let sub = k / n as f32;
-        let norm = 1.0 / (n * n) as f32;
-        self.patch
-            .data
-            .par_chunks_mut(p * 3)
-            .enumerate()
-            .for_each(|(j, row)| {
-                for i in 0..p {
-                    let mut acc = [0.0f32; 3];
-                    for b in 0..n {
-                        let v = y0 + j as f32 * k + (b as f32 + 0.5) * sub;
-                        for a in 0..n {
-                            let u = x0 + i as f32 * k + (a as f32 + 0.5) * sub;
-                            let [x, y] =
-                                from_upright([u as f64, v as f64], (frame.w, frame.h), rot);
-                            let px = bilinear(frame, x as f32 - 0.5, y as f32 - 0.5);
-                            for c in 0..3 {
-                                acc[c] += px[c];
-                            }
+        if k <= 1.0 {
+            // Enlarging (I'm far away): one bilinear sample per pixel is right.
+            self.patch
+                .data
+                .par_chunks_mut(p * 3)
+                .enumerate()
+                .for_each(|(j, row)| {
+                    for i in 0..p {
+                        let u = x0 + (i as f32 + 0.5) * k;
+                        let v = y0 + (j as f32 + 0.5) * k;
+                        let [x, y] = from_upright([u as f64, v as f64], (frame.w, frame.h), rot);
+                        let px = bilinear(frame, x as f32 - 0.5, y as f32 - 0.5);
+                        for c in 0..3 {
+                            row[i * 3 + c] = px[c].round().clamp(0.0, 255.0) as u8;
                         }
                     }
-                    for c in 0..3 {
-                        row[i * 3 + c] = (acc[c] * norm).round().clamp(0.0, 255.0) as u8;
+                });
+        } else {
+            // Shrinking: a box filter of point samples. The camera is only ever turned by a multiple of 90
+            // degrees, so each sample column (u) and row (v) of the upright picture lands on one camera column or
+            // row: work out their byte offsets once, then each sample is an add.
+            let n = (k.ceil() as usize).clamp(1, 8);
+            let sub = k / n as f32;
+            let (fw, fh) = (frame.w, frame.h);
+            let idx = |c: f32, len: usize| (c.floor().max(0.0) as usize).min(len - 1);
+            // Offset contributed by an upright coordinate along x (u) or y (v).
+            let u_off = |u: f32| match rot {
+                90 => idx(fh as f32 - u, fh) * fw * 3,
+                180 => idx(fw as f32 - u, fw) * 3,
+                270 => idx(u, fh) * fw * 3,
+                _ => idx(u, fw) * 3,
+            };
+            let v_off = |v: f32| match rot {
+                90 => idx(v, fw) * 3,
+                180 => idx(fh as f32 - v, fh) * fw * 3,
+                270 => idx(fw as f32 - v, fw) * 3,
+                _ => idx(v, fh) * fw * 3,
+            };
+            let us: Vec<usize> = (0..p * n)
+                .map(|t| u_off(x0 + (t as f32 + 0.5) * sub))
+                .collect();
+            let vs: Vec<usize> = (0..p * n)
+                .map(|t| v_off(y0 + (t as f32 + 0.5) * sub))
+                .collect();
+            let (nn, data) = ((n * n) as u32, &frame.data);
+            self.patch
+                .data
+                .par_chunks_mut(p * 3)
+                .enumerate()
+                .for_each(|(j, row)| {
+                    let rows = &vs[j * n..(j + 1) * n];
+                    for i in 0..p {
+                        let mut acc = [0u32; 3];
+                        for &vo in rows {
+                            for &uo in &us[i * n..(i + 1) * n] {
+                                let o = vo + uo;
+                                acc[0] += data[o] as u32;
+                                acc[1] += data[o + 1] as u32;
+                                acc[2] += data[o + 2] as u32;
+                            }
+                        }
+                        for c in 0..3 {
+                            row[i * 3 + c] = ((acc[c] + nn / 2) / nn) as u8;
+                        }
                     }
-                }
-            });
+                });
+        }
 
         // Composite: soft shadow, light border, squircle-masked picture.
         let margin = (out.w.min(out.h) as f32 * 0.03).round() as isize + SHADOW as isize;
@@ -265,79 +354,16 @@ impl Pip {
             self.seen.is_some_and(|t| t.elapsed().as_secs_f32() < 1.5),
         ) {
             (false, _) => "off".into(),
-            (true, true) => format!("on, {corner}"),
+            (true, true) => format!(
+                "on, {corner}, following {}",
+                if self.using_pose() {
+                    "pose"
+                } else {
+                    "the matte"
+                }
+            ),
             (true, false) => format!("on, {corner} (waiting to see you)"),
         }
-    }
-}
-
-/// Constant-velocity Kalman filter for one coordinate, with velocity damping (so it eases to a stop rather than
-/// overshooting) and gating (a measurement far from the prediction is ignored unless they keep coming).
-#[derive(Clone)]
-struct Kalman {
-    x: f32,
-    v: f32,
-    /// Covariance [[pp, pv], [pv, vv]].
-    p: [f32; 3],
-    /// Acceleration noise (px/s^2)^2: how freely it may change course.
-    q: f32,
-    /// Measurement noise (px)^2.
-    r: f32,
-    rejected: u32,
-}
-
-impl Kalman {
-    /// Velocity half-life, seconds.
-    const DAMP: f32 = 0.35;
-    /// Gate: an innovation beyond this many standard deviations is an outlier. The first is ignored; if more
-    /// follow (a real move, not a hand flicked up), they're let through clipped to a growing allowance, so a move
-    /// is followed smoothly instead of ignored and then jumped to.
-    const GATE: f32 = 3.5;
-
-    fn new(x: f32, q: f32, r: f32) -> Self {
-        Kalman {
-            x,
-            v: 0.0,
-            p: [r, 0.0, q * 0.05],
-            q,
-            r,
-            rejected: 0,
-        }
-    }
-
-    fn predict(&mut self, dt: f32) {
-        let dt = dt.clamp(0.0, 0.5);
-        let d = 0.5f32.powf(dt / Self::DAMP);
-        self.x += self.v * dt;
-        self.v *= d;
-        let [pp, pv, vv] = self.p;
-        // P = F P F' + Q, F = [[1, dt], [0, d]], Q from white acceleration noise.
-        let (dt2, dt3, dt4) = (dt * dt, dt * dt * dt, dt * dt * dt * dt);
-        self.p = [
-            pp + 2.0 * dt * pv + dt2 * vv + self.q * dt4 / 4.0,
-            d * (pv + dt * vv) + self.q * dt3 / 2.0,
-            d * d * vv + self.q * dt2,
-        ];
-    }
-
-    fn update(&mut self, z: f32) {
-        let mut y = z - self.x;
-        let limit = Self::GATE * (self.p[0] + self.r).sqrt();
-        if y.abs() > limit {
-            self.rejected += 1;
-            if self.rejected == 1 {
-                return;
-            }
-            y = y.clamp(-limit * self.rejected as f32, limit * self.rejected as f32);
-        } else {
-            self.rejected = 0;
-        }
-        let [pp, pv, vv] = self.p;
-        let s = pp + self.r;
-        let (k0, k1) = (pp / s, pv / s);
-        self.x += k0 * y;
-        self.v += k1 * y;
-        self.p = [(1.0 - k0) * pp, (1.0 - k0) * pv, vv - k1 * pv];
     }
 }
 
@@ -577,6 +603,38 @@ mod tests {
             lo > 90 && hi < 165,
             "stripes alias: inset values range {lo}..{hi}"
         );
+    }
+
+    #[test]
+    fn turned_camera_gives_the_same_inset_as_an_upright_one() {
+        // A random camera frame, and the same picture already turned upright (90 degrees clockwise).
+        let (w, h) = (300, 200);
+        let mut cam = Rgb::new(w, h);
+        let mut seed = 99u32;
+        for v in cam.data.iter_mut() {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            *v = seed as u8;
+        }
+        let mut upright = Rgb::new(h, w);
+        for y in 0..h {
+            for x in 0..w {
+                // Turning clockwise: camera (x, y) -> upright (h - 1 - y, x).
+                let (ux, uy) = (h - 1 - y, x);
+                upright.data[(uy * h + ux) * 3..][..3]
+                    .copy_from_slice(&cam.data[(y * w + x) * 3..][..3]);
+            }
+        }
+        let inset = |frame: &Rgb, rot: u32| {
+            let mut pip = Pip::new(0.2, Corner::TopLeft, true);
+            pip.crop = Some(CropFilter::new([100.0, 150.0, 120.0])); // 120 px crop -> 40 px inset: 3x shrink
+            pip.fade = 1.0;
+            let mut out = Rgb::new(200, 200);
+            pip.draw(frame, rot, &mut out);
+            pip.patch.data
+        };
+        assert_eq!(inset(&cam, 90), inset(&upright, 0));
     }
 
     #[test]

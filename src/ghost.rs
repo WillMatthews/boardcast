@@ -89,6 +89,9 @@ struct Shared {
     ready: Condvar,
     /// Newest matte and a counter bumped on every publish.
     matte: Mutex<(u64, Vec<f32>)>,
+    /// Whether to run pose (only while the picture-in-picture needs it), and its newest result + counter.
+    pose_on: AtomicBool,
+    person: Mutex<(u64, crate::pose::Person)>,
     stop: AtomicBool,
 }
 
@@ -100,6 +103,7 @@ pub struct Segmenter {
     pub w: usize,
     pub h: usize,
     seen: u64,
+    has_pose: bool,
 }
 
 impl Segmenter {
@@ -111,13 +115,27 @@ impl Segmenter {
         ratio: f32,
         threads: usize,
         max_fps: f32,
+        pose_model: Option<&Path>,
     ) -> Result<Self> {
         let mut matting = Matting::new(model, w, h, ratio, threads)?;
+        let mut pose = match pose_model {
+            Some(m) => match crate::pose::Pose::new(m, w, h, threads) {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    crate::say!("head tracking falls back to the matte: {e:#}");
+                    None
+                }
+            },
+            None => None,
+        };
+        let has_pose = pose.is_some();
         let min_period = std::time::Duration::from_secs_f32(1.0 / max_fps.max(0.1));
         let shared = Arc::new(Shared {
             frame: Mutex::new(None),
             ready: Condvar::new(),
             matte: Mutex::new((0, vec![0.0; w * h])),
+            pose_on: AtomicBool::new(false),
+            person: Mutex::new((0, Default::default())),
             stop: AtomicBool::new(false),
         });
         let sh = shared.clone();
@@ -145,6 +163,18 @@ impl Segmenter {
                         }
                         Err(e) => crate::say!("segmentation failed: {e:#}"),
                     }
+                    if let Some(p) = &mut pose
+                        && sh.pose_on.load(Ordering::Relaxed)
+                    {
+                        match p.run(&frame) {
+                            Ok(person) => {
+                                let mut h = sh.person.lock().unwrap();
+                                h.0 += 1;
+                                h.1 = person;
+                            }
+                            Err(e) => crate::say!("pose failed: {e:#}"),
+                        }
+                    }
                     // Cap the rate; the compositor's stillness gate tolerates matte lag, so ~10 Hz is plenty.
                     // Sleeping here (not before the run) means the next run takes the freshest frame.
                     if let Some(rest) = min_period.checked_sub(started.elapsed()) {
@@ -160,7 +190,19 @@ impl Segmenter {
             w,
             h,
             seen: 0,
+            has_pose,
         })
+    }
+
+    /// Run pose on each segmented frame (costs ~25 ms a run, so only while something uses it).
+    pub fn set_pose(&self, on: bool) {
+        self.shared.pose_on.store(on, Ordering::Relaxed);
+    }
+
+    /// The newest pose result (in the upright segmentation frame) and a counter that changes with each run;
+    /// None without a pose model.
+    pub fn person(&self) -> Option<(u64, crate::pose::Person)> {
+        self.has_pose.then(|| *self.shared.person.lock().unwrap())
     }
 
     /// Hand the worker the latest camera frame (downscaled here; cheap).

@@ -15,6 +15,17 @@ fn ort_err<E: std::fmt::Display>(e: E) -> anyhow::Error {
     anyhow!("onnxruntime: {e}")
 }
 
+/// The process's ONNX Runtime environment (ORT allows only one), shared by every session.
+pub fn ort_env() -> Result<ort::environment::Environment> {
+    static ENV: std::sync::Mutex<Option<ort::environment::Environment>> =
+        std::sync::Mutex::new(None);
+    let mut env = ENV.lock().unwrap();
+    if env.is_none() {
+        *env = Some(ort::init().with_name("boardvu").build().map_err(ort_err)?);
+    }
+    Ok(env.clone().unwrap())
+}
+
 pub struct Matting {
     session: Session,
     _env: ort::environment::Environment,
@@ -30,7 +41,7 @@ impl Matting {
     /// `w` x `h` is the size of the frames passed to `run`. `ratio` is RVM's internal downsample ratio:
     /// pick it so `ratio * max(w, h)` is roughly 256-512.
     pub fn new(model: &Path, w: usize, h: usize, ratio: f32, threads: usize) -> Result<Self> {
-        let env = ort::init().with_name("boardvu").build().map_err(ort_err)?;
+        let env = ort_env()?;
         let session = Session::builder(&env)
             .map_err(ort_err)?
             .with_intra_threads(threads)
