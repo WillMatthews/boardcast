@@ -9,6 +9,7 @@ mod image;
 mod keys;
 mod light;
 mod log;
+mod pip;
 mod secrets;
 mod segment;
 mod tui;
@@ -153,6 +154,15 @@ struct RunArgs {
     /// Leave the board light alone.
     #[arg(long)]
     no_light: bool,
+    /// Start with the picture-in-picture of me showing (toggle with `p`; needs ghost mode's segmentation).
+    #[arg(long)]
+    pip: bool,
+    /// Picture-in-picture size, as a fraction of the feed's width.
+    #[arg(long, default_value_t = 0.3)]
+    pip_size: f32,
+    /// Picture-in-picture corner (move it with `o`).
+    #[arg(long, value_enum, default_value_t = pip::Corner::BottomRight)]
+    pip_corner: pip::Corner,
     /// Plain log lines instead of the full-screen status display.
     #[arg(long)]
     no_tui: bool,
@@ -597,6 +607,7 @@ fn run(
     let mut enhancer = enhance::Enhancer::new(args.look, board.w, board.h);
     let mut enhanced = Rgb::new(board.w, board.h);
     let mut last_enhance = Instant::now() - Duration::from_secs(1);
+    let mut pip = pip::Pip::new(args.pip_size, args.pip_corner, args.pip && ghost.is_some());
     let board_watched = camera::watch_openers(&args.board);
     let started = Instant::now();
     // Full-screen status in a terminal; plain log lines otherwise (then keys come through `Keys`).
@@ -604,7 +615,7 @@ fn run(
     let keys = tui.is_none().then(keys::Keys::start);
     if tui.is_none() {
         say!(
-            "look: {:?} | keys: l = cycle look (plain/natural/paper), g = ghost (hidden/0.1/0.25/0.5/opaque)",
+            "look: {:?} | keys: l = cycle look (plain/natural/paper), g = ghost (hidden/0.1/0.25/0.5/opaque), p = picture-in-picture, o = move it",
             args.look
         );
     }
@@ -671,6 +682,17 @@ fn run(
                     last_enhance = Instant::now() - Duration::from_secs(1);
                     say!("look: {:?}", enhancer.look);
                 }
+                b'p' if ghost.is_some() => {
+                    pip.on = !pip.on;
+                    say!("picture-in-picture {}", if pip.on { "on" } else { "off" });
+                }
+                b'p' => say!(
+                    "picture-in-picture needs ghost mode (it follows me with the segmentation)"
+                ),
+                b'o' => {
+                    pip.corner = pip.corner.next();
+                    say!("picture-in-picture: {:?}", pip.corner);
+                }
                 b'g' => {
                     if let Some((_, g, _)) = &mut ghost {
                         let o = ghost::next_opacity(g.opacity());
@@ -695,6 +717,15 @@ fn run(
                     last_enhance = Instant::now();
                 }
                 g.overlay(&enhanced, &board, out);
+                let (m, mw, mh, version) = g.matte();
+                pip.track(
+                    m,
+                    mw,
+                    mh,
+                    version,
+                    image::upright_size((cam.w, cam.h), cfg.rotate),
+                );
+                pip.draw(&frame, cfg.rotate, out);
                 &*out
             }
             None => {
@@ -726,6 +757,7 @@ fn run(
                 raw: raw_out.as_ref().map(|(s, _, _, w)| feed(s, w)),
                 look: enhancer.look,
                 ghost: ghost.as_ref().map(|(_, g, _)| g.opacity()),
+                pip: ghost.as_ref().map(|_| pip.describe()),
                 tracker: tracker.as_ref(),
                 perf,
                 started,

@@ -37,6 +37,8 @@ pub struct Status<'a> {
     pub look: Look,
     /// Ghost opacity; None when ghost mode is off.
     pub ghost: Option<f32>,
+    /// Picture-in-picture state; None without ghost mode.
+    pub pip: Option<String>,
     pub tracker: Option<&'a Tracker>,
     pub perf: Perf,
     pub started: Instant,
@@ -231,6 +233,10 @@ fn render(f: &mut ratatui::Frame, s: &Status) {
             kv("ghost", v)
         }
     });
+    lines.push(match &s.pip {
+        None => kv("pip", "needs ghost mode".dark_gray()),
+        Some(d) => kv("pip", vec![dot(d != "off"), d.clone().into()]),
+    });
     f.render_widget(Paragraph::new(lines).block(block("view")), view);
 
     let p = s.perf;
@@ -280,7 +286,13 @@ fn render(f: &mut ratatui::Frame, s: &Status) {
         ]
     };
     let mut spans = Vec::new();
-    for (k, w) in [("l", "look"), ("g", "ghost"), ("q", "quit")] {
+    for (k, w) in [
+        ("l", "look"),
+        ("g", "ghost"),
+        ("p", "picture-in-picture"),
+        ("o", "move it"),
+        ("q", "quit"),
+    ] {
         spans.extend(key(k, w));
     }
     f.render_widget(Line::from(spans), keys);

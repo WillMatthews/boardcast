@@ -76,7 +76,13 @@ them), the look and ghost, board tracking, frame rate and CPU, and a log. `--no-
 prints plain log lines instead.
 
 **Keys while streaming:** `l` cycles the look (plain → natural → paper), `g` steps me through hidden → ghost 0.1 → ghost 0.25 → ghost 0.5 → opaque (fully
-shown, no ghosting). `q`, Esc or Ctrl-C stops.
+shown, no ghosting). `p` toggles a picture-in-picture of me, `o` moves it to the next corner. `q`, Esc or Ctrl-C stops.
+
+**Picture-in-picture.** A squircle crop of me, inset in a corner of the board feed (same resolution, so meeting
+apps don't notice it coming and going). It follows my head using ghost mode's person matte (so it needs ghost
+mode), framed about three head-widths wide so it looks the same at the board or at the desk, and fades out when I
+leave the frame. `--pip` starts with it on; `--pip-size` (fraction of the feed's width, default 0.3) and
+`--pip-corner` set it up.
 
 ### Looks
 

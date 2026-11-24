@@ -207,6 +207,8 @@ pub struct Ghost {
     /// Segmentation-space matte -> board canvas.
     mask_map: ResampleMap,
     seg_alpha: Vec<f32>,
+    /// Counts new mattes (for things that follow me, like the picture-in-picture).
+    matte_version: u64,
     /// Dilated matte in segmentation space (dilating there is ~30x cheaper than at board resolution).
     seg_grown: Vec<f32>,
     seg_scratch: Vec<f32>,
@@ -251,6 +253,7 @@ impl Ghost {
             h,
             mask_map,
             seg_alpha: vec![0.0; seg_w * seg_h],
+            matte_version: 0,
             alpha: vec![0.0; n],
             grown: vec![0.0; n],
             hold: vec![0.0; n],
@@ -265,6 +268,7 @@ impl Ghost {
     /// is one) and write the memory, without me, to `board`. Draw me over it afterwards with `overlay`.
     pub fn step(&mut self, live: &Rgb, seg: &mut Segmenter, board: &mut Rgb) {
         let fresh = seg.latest(&mut self.seg_alpha);
+        self.matte_version += fresh as u64;
         self.composite(live, fresh, board);
     }
 
@@ -276,6 +280,11 @@ impl Ghost {
         self.started = false;
         self.hold.fill(0.0);
         self.still.fill(0);
+    }
+
+    /// The latest person matte, in the (upright) segmentation frame: (matte, width, height, version).
+    pub fn matte(&self) -> (&[f32], usize, usize, u64) {
+        (&self.seg_alpha, self.seg_w, self.seg_h, self.matte_version)
     }
 
     pub fn opacity(&self) -> f32 {
