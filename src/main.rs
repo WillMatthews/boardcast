@@ -663,7 +663,7 @@ fn run(
     let keys = tui.is_none().then(keys::Keys::start);
     if tui.is_none() {
         say!(
-            "look: {:?} | keys: l = cycle look (plain/natural/paper), g = toggle ghost, t = LaTeX view, \
+            "look: {:?} | keys: l = cycle look (plain/natural/paper), g = ghost (hidden/0.1/0.25/opaque), t = LaTeX view, \
              r = re-transcribe",
             args.look
         );
@@ -744,13 +744,9 @@ fn run(
                 }
                 b'g' => {
                     if let Some((_, g, _)) = &mut ghost {
-                        let o = if g.opacity() > 0.0 {
-                            0.0
-                        } else {
-                            args.ghost_opacity.max(0.05)
-                        };
+                        let o = ghost::next_opacity(g.opacity());
                         g.set_opacity(o);
-                        say!("ghost opacity: {o}");
+                        say!("ghost: {}", ghost::describe(o));
                     }
                 }
                 _ => {}

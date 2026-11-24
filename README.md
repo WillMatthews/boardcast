@@ -76,7 +76,8 @@ them), the look, ghost and LaTeX view, board tracking, the LaTeX view's cost (la
 and an estimate per transcription), frame rate and CPU, and a log. `--no-tui` (or running without a terminal)
 prints plain log lines instead.
 
-**Keys while streaming:** `l` cycles the look (plain → natural → paper), `g` hides/shows the ghost, `t` toggles the
+**Keys while streaming:** `l` cycles the look (plain → natural → paper), `g` steps me through hidden → ghost 0.1 → ghost 0.25 → opaque (fully
+shown, no ghosting), `t` toggles the
 LaTeX view, `r` re-transcribes. `q`, Esc or Ctrl-C stops.
 
 ### LaTeX view (`t`)

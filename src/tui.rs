@@ -215,11 +215,31 @@ fn render(f: &mut ratatui::Frame, s: &Status) {
     )];
     lines.push(match s.ghost {
         None => kv("ghost", "off (--no-ghost)".dark_gray()),
-        Some(o) if o > 0.0 => kv(
-            "ghost",
-            vec![dot(true), format!("shown, opacity {o:.2}").into()],
-        ),
-        Some(_) => kv("ghost", vec![dot(false), "hidden".into()]),
+        Some(o) => {
+            let step = |v: f32, name: &'static str| {
+                if (o - v).abs() < 1e-3 {
+                    Span::styled(format!("[{name}]"), Style::new().bold().fg(Color::Cyan))
+                } else {
+                    Span::styled(format!(" {name} "), LABEL)
+                }
+            };
+            let mut v = vec![
+                step(0.0, "hidden"),
+                step(0.1, "0.1"),
+                step(0.25, "0.25"),
+                step(1.0, "opaque"),
+            ];
+            if !crate::ghost::OPACITY_STEPS
+                .iter()
+                .any(|s| (o - s).abs() < 1e-3)
+            {
+                v.push(Span::styled(
+                    format!("[{o:.2}]"),
+                    Style::new().bold().fg(Color::Cyan),
+                ));
+            }
+            kv("ghost", v)
+        }
     });
     lines.push(match s.latex {
         None => kv("LaTeX", "unavailable (see log)".dark_gray()),

@@ -22,6 +22,28 @@ use rayon::prelude::*;
 use crate::image::{ROWS_PER_TASK, ResampleMap, Rgb};
 use crate::segment::Matting;
 
+/// What `g` steps through: hidden, faint, the default ghost, and opaque (me fully drawn, no ghosting).
+pub const OPACITY_STEPS: [f32; 4] = [0.0, 0.1, 0.25, 1.0];
+
+/// The next step after `current` (wrapping to hidden after opaque; a custom --ghost-opacity joins at the next step up).
+pub fn next_opacity(current: f32) -> f32 {
+    OPACITY_STEPS
+        .iter()
+        .copied()
+        .find(|&o| o > current + 1e-3)
+        .unwrap_or(0.0)
+}
+
+pub fn describe(opacity: f32) -> String {
+    if opacity <= 0.0 {
+        "hidden".into()
+    } else if opacity >= 1.0 {
+        "opaque (no ghosting)".into()
+    } else {
+        format!("ghost {opacity:.2}")
+    }
+}
+
 pub struct GhostParams {
     /// How visible I am over the board (0 = invisible, 1 = fully live).
     pub opacity: f32,
@@ -451,6 +473,18 @@ mod tests {
         }
         let t = arrived.expect("chalk never appeared");
         assert!(t <= 15, "chalk took {t} frames (> 0.5 s at 30 fps)");
+    }
+
+    #[test]
+    fn g_cycles_hidden_faint_ghost_opaque() {
+        let mut o = 0.25; // the default
+        let mut seen = Vec::new();
+        for _ in 0..5 {
+            o = next_opacity(o);
+            seen.push(o);
+        }
+        assert_eq!(seen, [1.0, 0.0, 0.1, 0.25, 1.0]);
+        assert_eq!(next_opacity(0.4), 1.0); // a custom --ghost-opacity
     }
 
     #[test]
