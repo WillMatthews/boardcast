@@ -190,7 +190,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "boardvu"
+name = "boardcast"
 version = "0.1.0"
 dependencies = [
  "anyhow",

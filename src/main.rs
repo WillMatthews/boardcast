@@ -1,4 +1,4 @@
-//! boardvu: a webcam pointed at a blackboard -> two v4l2loopback cameras (raw passthrough + deskewed board).
+//! boardcast: a webcam pointed at a blackboard -> two v4l2loopback cameras (raw passthrough + deskewed board).
 
 mod calib;
 mod camera;
@@ -220,7 +220,7 @@ impl ConfigFile {
         Ok(Config {
             corners: self.corners.with_context(|| {
                 format!(
-                    "{} has no board corners yet: run `boardvu setup`, then `boardvu calibrate --from \"x,y x,y x,y x,y\"`",
+                    "{} has no board corners yet: run `boardcast setup`, then `boardcast calibrate --from \"x,y x,y x,y x,y\"`",
                     path.display()
                 )
             })?,
@@ -313,7 +313,7 @@ fn save_focus(path: &Path, focus: i64) -> Result<()> {
 fn load_config(path: &Path) -> Result<ConfigFile> {
     if !path.exists() {
         anyhow::bail!(
-            "no config at {}: run `boardvu setup` first (or pass --config)",
+            "no config at {}: run `boardcast setup` first (or pass --config)",
             path.display()
         );
     }
@@ -606,8 +606,8 @@ fn setup(
 
 Next: read the board's four corners off it (roughly is fine, within ~50 px), starting with the board's own top-left
 and going clockwise (top-right, bottom-right, bottom-left), and run
-    boardvu calibrate --from \"x,y x,y x,y x,y\"
-then `boardvu focus` (stand aside) and `boardvu snap out/` to check the result.",
+    boardcast calibrate --from \"x,y x,y x,y x,y\"
+then `boardcast focus` (stand aside) and `boardcast snap out/` to check the result.",
         png.display()
     );
     Ok(())
@@ -686,7 +686,7 @@ fn calibrate_cmd(
         None => {
             let start = from.or(cfg.corners).context(
                 "no corners to start from yet: give rough ones with --from \"x,y x,y x,y x,y\" (read them off \
-                 setup.png from `boardvu setup`)",
+                 setup.png from `boardcast setup`)",
             )?;
             let fit = calib::calibrate(&frame, &start, search)
                 .context("couldn't find all four board edges near the starting corners (try --search or --from)")?;

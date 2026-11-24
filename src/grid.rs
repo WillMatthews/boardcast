@@ -1,4 +1,4 @@
-//! A labelled pixel grid over a camera frame, for reading off rough board corners by eye (`boardvu setup`).
+//! A labelled pixel grid over a camera frame, for reading off rough board corners by eye (`boardcast setup`).
 
 use crate::image::Rgb;
 

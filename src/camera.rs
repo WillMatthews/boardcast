@@ -49,7 +49,7 @@ pub fn largest_mjpeg(path: &str) -> Result<(usize, usize)> {
         .map(|d| (d.width as usize, d.height as usize))
         .filter(|&(w, h)| w % 2 == 0 && h % 2 == 0)
         .max_by_key(|&(w, h)| w * h)
-        .with_context(|| format!("{path} offers no MJPEG frame sizes (boardvu needs an MJPEG webcam)"))
+        .with_context(|| format!("{path} offers no MJPEG frame sizes (boardcast needs an MJPEG webcam)"))
 }
 
 impl Camera {

@@ -1,4 +1,4 @@
-# boardvu
+# boardcast
 
 ## The idea
 
@@ -11,8 +11,8 @@ This should be another "virtual camera" that I can share to a meeting.
 
 - My green chalkboard (portrait, aluminium frame, sticky notes down the right edge), one webcam
   (Anker PowerConf C200, `/dev/video0`, 2560×1440 MJPEG), used live on video calls.
-- Run on demand: start boardvu for a call, stop it afterwards. While it runs it owns `/dev/video0`;
-  other tools (e.g. `~/coding/ml/learn/board.py`) use the camera when boardvu is stopped.
+- Run on demand: start boardcast for a call, stop it afterwards. While it runs it owns `/dev/video0`;
+  other tools (e.g. `~/coding/ml/learn/board.py`) use the camera when boardcast is stopped.
 - Linux only (v4l2loopback). Written in Rust.
 
 ## Outputs

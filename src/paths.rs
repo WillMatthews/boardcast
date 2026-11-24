@@ -1,5 +1,5 @@
-//! Where boardvu keeps its files: config in `$XDG_CONFIG_HOME/boardvu` (default `~/.config/boardvu`), models in
-//! `$XDG_DATA_HOME/boardvu/models` (default `~/.local/share/boardvu/models`).
+//! Where boardcast keeps its files: config in `$XDG_CONFIG_HOME/boardcast` (default `~/.config/boardcast`), models in
+//! `$XDG_DATA_HOME/boardcast/models` (default `~/.local/share/boardcast/models`).
 
 use std::path::PathBuf;
 
@@ -8,7 +8,7 @@ fn xdg(var: &str, fallback: &str) -> PathBuf {
         Some(dir) => PathBuf::from(dir),
         None => PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(fallback),
     }
-    .join("boardvu")
+    .join("boardcast")
 }
 
 /// A file in the config directory.

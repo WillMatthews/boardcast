@@ -274,7 +274,7 @@ impl Tracker {
                 if self.failures == 15 {
                     crate::say!(
                         "can't find the board's edges near where they should be (30 s). If the camera moved \
-                         a lot, stop and run `boardvu calibrate`."
+                         a lot, stop and run `boardcast calibrate`."
                     );
                 }
                 return None;

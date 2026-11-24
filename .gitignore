@@ -1,7 +1,7 @@
 /target
 /models/
 /out/
-# Your own setup lives in ~/.config/boardvu; these are old copies or calibrate/setup output.
+# Your own setup lives in ~/.config/boardcast; these are old copies or calibrate/setup output.
 /board.json
 /light.json
 /calib.png

@@ -2,8 +2,8 @@
 # Download the person-segmentation model: Robust Video Matting, MobileNetV3, fp32 ONNX (~15 MB, GPL-3.0).
 # https://github.com/PeterL1n/RobustVideoMatting
 set -e
-# Saved to ${XDG_DATA_HOME:-~/.local/share}/boardvu/models, where boardvu looks for it.
-dir="${XDG_DATA_HOME:-$HOME/.local/share}/boardvu/models"
+# Saved to ${XDG_DATA_HOME:-~/.local/share}/boardcast/models, where boardcast looks for it.
+dir="${XDG_DATA_HOME:-$HOME/.local/share}/boardcast/models"
 mkdir -p "$dir"
 f="$dir/rvm_mobilenetv3_fp32.onnx"
 curl -fL --progress-bar -o "$f.part" \

@@ -26,7 +26,7 @@ pub struct Perf {
     pub wait_ms: f64,
     pub decode_ms: f64,
     pub work_ms: f64,
-    /// CPU used by boardvu, in cores.
+    /// CPU used by boardcast, in cores.
     pub cpu: f64,
 }
 
@@ -151,7 +151,7 @@ fn render(f: &mut ratatui::Frame, s: &Status) {
     let up = s.started.elapsed().as_secs();
     f.render_widget(
         Line::from(vec![
-            " boardvu ".bold().black().on_green(),
+            " boardcast ".bold().black().on_green(),
             format!("  up {}:{:02}:{:02}", up / 3600, up / 60 % 60, up % 60).dark_gray(),
         ]),
         title,

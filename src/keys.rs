@@ -22,7 +22,7 @@ impl Keys {
                 return Keys { rx, saved: None };
             }
             let saved = t;
-            // Keep ISIG so Ctrl-C still stops boardvu.
+            // Keep ISIG so Ctrl-C still stops boardcast.
             t.c_lflag &= !(libc::ICANON | libc::ECHO);
             t.c_cc[libc::VMIN] = 1;
             t.c_cc[libc::VTIME] = 0;

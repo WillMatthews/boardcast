@@ -21,7 +21,7 @@ pub fn ort_env() -> Result<ort::environment::Environment> {
         std::sync::Mutex::new(None);
     let mut env = ENV.lock().unwrap();
     if env.is_none() {
-        *env = Some(ort::init().with_name("boardvu").build().map_err(ort_err)?);
+        *env = Some(ort::init().with_name("boardcast").build().map_err(ort_err)?);
     }
     Ok(env.clone().unwrap())
 }

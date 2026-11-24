@@ -1,4 +1,4 @@
-//! The board light, through Home Assistant: on while boardvu runs, off when it stops, and adjustable from the keys
+//! The board light, through Home Assistant: on while boardcast runs, off when it stops, and adjustable from the keys
 //! (on/off, brightness, colour temperature).
 //!
 //! Settings live in `light.json` next to `board.json` (gitignored; see `light.example.json`). The token comes from
@@ -22,7 +22,7 @@ pub struct LightConfig {
     url: String,
     /// Light entity id, e.g. light.blackboard
     entity: String,
-    /// Extra `light.turn_on` service data while boardvu runs (brightness, color_temp_kelvin, ...).
+    /// Extra `light.turn_on` service data while boardcast runs (brightness, color_temp_kelvin, ...).
     #[serde(default)]
     on: Map<String, Value>,
 }
