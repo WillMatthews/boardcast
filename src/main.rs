@@ -5,11 +5,13 @@ mod camera;
 mod enhance;
 mod geom;
 mod ghost;
+mod hand;
 mod image;
 mod keys;
 mod light;
 mod log;
 mod pip;
+mod pointer;
 mod pose;
 mod secrets;
 mod segment;
@@ -159,6 +161,15 @@ struct RunArgs {
     /// Start with the picture-in-picture of me showing (toggle with `p`; needs ghost mode's segmentation).
     #[arg(long)]
     pip: bool,
+    /// Start with the pointer on (toggle with `w`; needs ghost mode, the pose model and the hand model).
+    #[arg(long)]
+    pointer: bool,
+    /// Show the pointer whenever my hand is over the board, not only while I'm pointing (index finger out).
+    #[arg(long)]
+    pointer_always: bool,
+    /// Hand landmark model for the pointer (MediaPipe, ONNX).
+    #[arg(long, default_value = concat!(env!("CARGO_MANIFEST_DIR"), "/models/hand_landmarks.onnx"))]
+    hand_model: PathBuf,
     /// Pose model for finding my head in the picture-in-picture (YOLO pose, ONNX).
     #[arg(long, default_value = concat!(env!("CARGO_MANIFEST_DIR"), "/models/yolo11n-pose.onnx"))]
     pose_model: PathBuf,
@@ -643,6 +654,37 @@ fn run(
     let mut enhanced = Rgb::new(board.w, board.h);
     let mut last_enhance = Instant::now() - Duration::from_secs(1);
     let mut pip = pip::Pip::new(args.pip_size, args.pip_corner, args.pip && ghost.is_some());
+    let mut pointer = pointer::Pointer::new(
+        &cfg.corners,
+        (cw, ch),
+        (bw, bh),
+        args.pointer && ghost.is_some(),
+    )?;
+    // Fingertip tracking for the pointer (it needs it: there's no rougher fallback).
+    let mut hands = if ghost.is_none() {
+        None
+    } else if !args.hand_model.exists() {
+        say!(
+            "no hand model ({}): pointer unavailable (scripts/fetch-hand-model.sh)",
+            args.hand_model.display()
+        );
+        None
+    } else {
+        // Both hands take turns: ~10 Hz each.
+        match hand::HandTracker::start(&args.hand_model, 2, 20.0) {
+            Ok(h) => Some(h),
+            Err(e) => {
+                say!("hand tracking off: {e:#}");
+                None
+            }
+        }
+    };
+    pointer.on &= hands.is_some();
+    // Per hand ([left, right]): the last result used, and the last time it was seen.
+    let mut hand_seen = [0u64; 2];
+    let mut last_hand: [Option<(Instant, hand::Hand)>; 2] = [None; 2];
+    // Which hand the dot is on: it stays there while that hand keeps pointing, so it doesn't flip between hands.
+    let mut pointing_hand: Option<usize> = None;
     let board_watched = camera::watch_openers(&args.board);
     let started = Instant::now();
     // Full-screen status in a terminal; plain log lines otherwise (then keys come through `Keys`).
@@ -650,7 +692,7 @@ fn run(
     let keys = tui.is_none().then(keys::Keys::start);
     if tui.is_none() {
         say!(
-            "look: {:?} | keys: l = cycle look (plain/natural/paper), g = ghost (hidden/0.1/0.25/0.5/opaque), p = picture-in-picture, o = move it",
+            "look: {:?} | keys: l = cycle look (plain/natural/paper), g = ghost (hidden/0.1/0.25/0.5/opaque), p = picture-in-picture, o = move it, w = pointer",
             args.look
         );
     }
@@ -695,6 +737,7 @@ fn run(
             if let Some((_, g, _)) = &mut ghost {
                 let (map, scale) = mask_map_for(&c, (cam.w, cam.h), cfg.rotate, seg_res, dims)?;
                 g.recalibrate(map, scale);
+                pointer.set_corners(&c)?;
             }
             if let Err(e) = save_corners(config_path, &c) {
                 say!("warning: couldn't save the new corners: {e:#}");
@@ -797,6 +840,13 @@ fn run(
                         None => say!("can't adjust focus: the camera won't say where it is"),
                     }
                 }
+                b'w' if hands.is_some() => {
+                    pointer.on = !pointer.on;
+                    say!("pointer {}", if pointer.on { "on" } else { "off" });
+                }
+                b'w' => say!(
+                    "the pointer needs ghost mode and the hand model (scripts/fetch-hand-model.sh)"
+                ),
                 b'o' => {
                     pip.corner = pip.corner.next();
                     say!("picture-in-picture: {:?}", pip.corner);
@@ -825,11 +875,46 @@ fn run(
                     last_enhance = Instant::now();
                 }
                 g.overlay(&enhanced, &board, out);
-                seg.set_pose(pip.on);
+                seg.set_pose(pip.on || pointer.on);
                 let up = image::upright_size((cam.w, cam.h), cfg.rotate);
                 let person = seg.person();
                 if let Some((version, person)) = person {
                     pip.track_head(version, person.head, (seg.w, seg.h), up);
+                }
+                if let (Some(ht), true) = (&mut hands, pointer.on) {
+                    // Crop around each hand: from its last landmarks while tracking it, else from pose's arm.
+                    let k = up.0 as f32 / seg.w as f32;
+                    let rois: [Option<hand::Roi>; 2] = std::array::from_fn(|side| {
+                        let from_pose = || {
+                            let p = person?.1;
+                            let (w, e) = (p.wrists[side]?, p.elbows[side]?);
+                            hand::Roi::from_arm([w[0] * k, w[1] * k], [e[0] * k, e[1] * k])
+                        };
+                        last_hand[side]
+                            .filter(|(t, _)| t.elapsed() < Duration::from_millis(300))
+                            .and_then(|(_, h)| hand::Roi::from_hand(&h.pts))
+                            .or_else(from_pose)
+                    });
+                    ht.submit(&frame, cfg.rotate, rois);
+                    for (side, (v, h)) in ht.latest().into_iter().enumerate() {
+                        if v == hand_seen[side] {
+                            continue;
+                        }
+                        hand_seen[side] = v;
+                        last_hand[side] = h.map(|h| (Instant::now(), h));
+                        let pointing = h.is_some_and(|h| args.pointer_always || h.pointing());
+                        if !pointing {
+                            if pointing_hand == Some(side) {
+                                pointing_hand = None;
+                            }
+                            continue;
+                        }
+                        // Take over only if the other hand isn't already the one pointing.
+                        if pointing_hand.is_none_or(|p| p == side) {
+                            pointing_hand = Some(side);
+                            pointer.point_at(h.unwrap().index_tip(), (cam.w, cam.h), cfg.rotate);
+                        }
+                    }
                 }
                 let (m, mw, mh, version) = g.matte();
                 pip.track(
@@ -839,6 +924,7 @@ fn run(
                     version,
                     image::upright_size((cam.w, cam.h), cfg.rotate),
                 );
+                pointer.draw(out);
                 pip.draw(&frame, cfg.rotate, out);
                 &*out
             }
@@ -878,6 +964,7 @@ fn run(
                     Focus::Fixed(v) if Some(v) == board_focus => format!("board ({v})"),
                     Focus::Fixed(v) => format!("board ({v}, saving…)"),
                 },
+                pointer: hands.as_ref().map(|_| pointer.describe()),
                 tracker: tracker.as_ref(),
                 perf,
                 started,

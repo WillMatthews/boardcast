@@ -1,4 +1,4 @@
-//! Smoothing for things that follow me (the picture-in-picture crop).
+//! Smoothing for things that follow me (the picture-in-picture crop, the pointer).
 
 /// Constant-velocity Kalman filter for one coordinate, with velocity damping (so it eases to a stop rather than
 /// overshooting) and gating (a measurement far from the prediction is ignored unless they keep coming).
