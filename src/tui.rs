@@ -1,4 +1,4 @@
-//! Full-screen status while streaming: feeds, view, board tracking, performance, log, keys.
+//! Full-screen status while streaming: feeds, view, board tracking, LaTeX costs, performance, log, keys.
 
 use std::io::IsTerminal;
 use std::time::{Duration, Instant};
@@ -12,6 +12,7 @@ use ratatui::widgets::{Block, Paragraph, Wrap};
 
 use crate::calib::Tracker;
 use crate::enhance::Look;
+use crate::latex::{State, Transcriber};
 
 pub struct Feed<'a> {
     pub path: &'a str,
@@ -37,6 +38,8 @@ pub struct Status<'a> {
     pub look: Look,
     /// Ghost opacity; None when ghost mode is off.
     pub ghost: Option<f32>,
+    pub latex: Option<&'a Transcriber>,
+    pub latex_view: bool,
     pub tracker: Option<&'a Tracker>,
     pub perf: Perf,
     pub started: Instant,
@@ -131,11 +134,19 @@ fn ago(t: Instant) -> String {
     }
 }
 
+fn dollars(x: f64) -> String {
+    if x < 0.01 {
+        format!("${x:.4}")
+    } else {
+        format!("${x:.2}")
+    }
+}
+
 fn render(f: &mut ratatui::Frame, s: &Status) {
     let [title, top, mid, log, keys] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(6),
-        Constraint::Length(6),
+        Constraint::Length(7),
         Constraint::Min(3),
         Constraint::Length(1),
     ])
@@ -192,7 +203,7 @@ fn render(f: &mut ratatui::Frame, s: &Status) {
 
     let look = |l: Look| {
         let name = format!("{l:?}").to_lowercase();
-        if l == s.look {
+        if l == s.look && !(s.latex_view && s.latex.is_some_and(|t| t.page.is_some())) {
             Span::styled(format!("[{name}]"), Style::new().bold().fg(Color::Cyan))
         } else {
             Span::styled(format!(" {name} "), LABEL)
@@ -230,7 +241,91 @@ fn render(f: &mut ratatui::Frame, s: &Status) {
             kv("ghost", v)
         }
     });
+    lines.push(match s.latex {
+        None => kv("LaTeX", "unavailable (see log)".dark_gray()),
+        Some(t) => {
+            let showing = s.latex_view && t.page.is_some();
+            let mut v = vec![
+                dot(showing),
+                if showing {
+                    "showing".cyan().bold()
+                } else if s.latex_view {
+                    "on".into()
+                } else {
+                    "off".into()
+                },
+            ];
+            if let State::Working(since) = t.state {
+                v.push(format!("  transcribing… {} s", since.elapsed().as_secs()).yellow());
+            }
+            kv("LaTeX", v)
+        }
+    });
     f.render_widget(Paragraph::new(lines).block(block("view")), view);
+
+    let [cost, perf] =
+        Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(mid);
+    let lines = match s.latex {
+        None => vec![Line::from("LaTeX view off".dark_gray())],
+        Some(t) => {
+            let model = if t.p.effort.is_empty() {
+                t.p.model.clone()
+            } else {
+                format!("{} ({} effort)", t.p.model, t.p.effort)
+            };
+            let mut l = vec![kv("model", model)];
+            if t.calls == 0 {
+                l.push(kv("last", "no transcriptions yet".dark_gray()));
+            } else {
+                l.push(kv(
+                    "last",
+                    format!(
+                        "{} in {:.0} s · {}k in / {}k out",
+                        dollars(t.last_cost),
+                        t.last_secs,
+                        (t.last_usage.input as f64 / 1e3 * 10.0).round() / 10.0,
+                        (t.last_usage.output as f64 / 1e3 * 10.0).round() / 10.0
+                    ),
+                ));
+            }
+            l.push(kv(
+                "session",
+                vec![
+                    dollars(t.total_cost()).bold(),
+                    format!("  {} call{}", t.calls, if t.calls == 1 { "" } else { "s" }).into(),
+                    if t.calls > 0 {
+                        format!(", {} each", dollars(t.total_cost() / t.calls as f64)).dark_gray()
+                    } else {
+                        "".into()
+                    },
+                ],
+            ));
+            let per = if t.calls > 0 {
+                t.total_cost() / t.calls as f64
+            } else {
+                1.3e3 * t.p.price_in / 1e6 + 2e3 * t.p.price_out / 1e6
+            };
+            l.push(kv(
+                "estimate",
+                format!(
+                    "{} per transcription · 100 for {}",
+                    dollars(per),
+                    dollars(per * 100.0)
+                )
+                .dark_gray(),
+            ));
+            l.push(kv(
+                "prices",
+                format!(
+                    "${:.2} / ${:.2} per M tokens in / out",
+                    t.p.price_in, t.p.price_out
+                )
+                .dark_gray(),
+            ));
+            l
+        }
+    };
+    f.render_widget(Paragraph::new(lines).block(block("LaTeX cost")), cost);
 
     let p = s.perf;
     let lines = vec![
@@ -248,7 +343,7 @@ fn render(f: &mut ratatui::Frame, s: &Status) {
             format!("{:.1} ms per frame (warp, ghost, look, write)", p.work_ms),
         ),
     ];
-    f.render_widget(Paragraph::new(lines).block(block("performance")), mid);
+    f.render_widget(Paragraph::new(lines).block(block("performance")), perf);
 
     let n = log.height.saturating_sub(2) as usize;
     let lines: Vec<Line> = crate::log::recent(n)
@@ -279,7 +374,13 @@ fn render(f: &mut ratatui::Frame, s: &Status) {
         ]
     };
     let mut spans = Vec::new();
-    for (k, w) in [("l", "look"), ("g", "ghost"), ("q", "quit")] {
+    for (k, w) in [
+        ("l", "look"),
+        ("g", "ghost"),
+        ("t", "LaTeX"),
+        ("r", "re-transcribe"),
+        ("q", "quit"),
+    ] {
         spans.extend(key(k, w));
     }
     f.render_widget(Line::from(spans), keys);

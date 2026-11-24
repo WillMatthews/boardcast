@@ -7,6 +7,7 @@ mod geom;
 mod ghost;
 mod image;
 mod keys;
+mod latex;
 mod light;
 mod log;
 mod secrets;
@@ -156,6 +157,22 @@ struct RunArgs {
     /// Plain log lines instead of the full-screen status display.
     #[arg(long)]
     no_tui: bool,
+    /// Turn off the LaTeX view (`t`), which sends the board to OpenAI.
+    #[arg(long)]
+    no_latex: bool,
+    /// OpenAI model for the LaTeX view.
+    #[arg(long, default_value = "gpt-6-luna")]
+    latex_model: String,
+    /// Reasoning effort for the LaTeX view (none, low, medium, high; empty = the model's default). Higher reads
+    /// messy writing better but takes longer: low ~15 s, medium ~40 s.
+    #[arg(long, default_value = "low")]
+    latex_effort: String,
+    /// Model price, US dollars per million input tokens (for the cost shown).
+    #[arg(long, default_value_t = 0.10)]
+    latex_price_in: f64,
+    /// Model price, US dollars per million output tokens (reasoning included).
+    #[arg(long, default_value_t = 0.50)]
+    latex_price_out: f64,
 }
 
 #[derive(Deserialize)]
@@ -498,6 +515,26 @@ fn seg_bench(
     Ok(())
 }
 
+/// Start a LaTeX transcription of `board` (the board memory, or the live board without ghost mode).
+fn request_latex(
+    t: &mut latex::Transcriber,
+    board: &Rgb,
+    canvas: (usize, usize),
+    dims: (usize, usize),
+    force: bool,
+) {
+    let mut paper = Rgb::new(board.w, board.h);
+    // A fresh enhancer measures the lighting on its first frame.
+    enhance::Enhancer::new(enhance::Look::Paper, board.w, board.h).apply(board, &mut paper);
+    if t.request(&paper, canvas, dims, BG, force) {
+        say!("LaTeX: transcribing with {}...", t.p.model);
+    } else if t.busy() {
+        say!("LaTeX: already transcribing");
+    } else {
+        say!("LaTeX: board unchanged, showing the last page (r to redo)");
+    }
+}
+
 /// Segmentation-frame -> board-canvas warp for the ghost's matte, and segmentation pixels per board pixel.
 /// Segmentation runs on the upright picture, so the corners are turned too.
 fn mask_map_for(
@@ -597,6 +634,28 @@ fn run(
     let mut enhancer = enhance::Enhancer::new(args.look, board.w, board.h);
     let mut enhanced = Rgb::new(board.w, board.h);
     let mut last_enhance = Instant::now() - Duration::from_secs(1);
+    let mut transcriber = if args.no_latex {
+        None
+    } else {
+        let p = latex::Params {
+            model: args.latex_model.clone(),
+            effort: args.latex_effort.clone(),
+            price_in: args.latex_price_in,
+            price_out: args.latex_price_out,
+            out_dir: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("out/latex"),
+            aspect: bw as f64 / bh as f64,
+        };
+        match latex::Transcriber::start(p) {
+            Ok(t) => Some(t),
+            Err(e) => {
+                say!("LaTeX view off: {e:#}");
+                None
+            }
+        }
+    };
+    let mut latex_view = false;
+    // Set by `t`/`r`: transcribe the board once this frame's board memory is ready (true = even if unchanged).
+    let mut want_latex: Option<bool> = None;
     let board_watched = camera::watch_openers(&args.board);
     let started = Instant::now();
     // Full-screen status in a terminal; plain log lines otherwise (then keys come through `Keys`).
@@ -604,7 +663,8 @@ fn run(
     let keys = tui.is_none().then(keys::Keys::start);
     if tui.is_none() {
         say!(
-            "look: {:?} | keys: l = cycle look (plain/natural/paper), g = ghost (hidden/0.1/0.25/opaque)",
+            "look: {:?} | keys: l = cycle look (plain/natural/paper), g = ghost (hidden/0.1/0.25/opaque), t = LaTeX view, \
+             r = re-transcribe",
             args.look
         );
     }
@@ -671,6 +731,17 @@ fn run(
                     last_enhance = Instant::now() - Duration::from_secs(1);
                     say!("look: {:?}", enhancer.look);
                 }
+                b't' if transcriber.is_some() => {
+                    latex_view = !latex_view;
+                    if latex_view {
+                        want_latex = Some(false);
+                    }
+                    say!("LaTeX view {}", if latex_view { "on" } else { "off" });
+                }
+                b'r' if transcriber.is_some() => {
+                    latex_view = true;
+                    want_latex = Some(true);
+                }
                 b'g' => {
                     if let Some((_, g, _)) = &mut ghost {
                         let o = ghost::next_opacity(g.opacity());
@@ -681,25 +752,65 @@ fn run(
                 _ => {}
             }
         }
+        if let Some(t) = &mut transcriber {
+            if t.poll() {
+                say!(
+                    "LaTeX: typeset in {:.0} s, ${:.4} (session: {} calls, ${:.4}) -> {}",
+                    t.last_secs,
+                    t.last_cost,
+                    t.calls,
+                    t.total_cost(),
+                    t.last_dir
+                        .as_ref()
+                        .map(|d| d.display().to_string())
+                        .unwrap_or_default()
+                );
+            } else if let latex::State::Failed(e) = &t.state {
+                say!("LaTeX failed after {:.0} s: {e}", t.last_secs);
+                t.state = latex::State::Idle;
+                latex_view = t.page.is_some() && latex_view;
+            }
+        }
         // Board memory (or the live board) -> chalk enhancement -> me drawn over it.
         let shown = match &mut ghost {
             Some((seg, g, out)) => {
                 seg.submit(&frame);
                 g.step(&board, seg, out);
+                if let (Some(force), Some(t)) = (want_latex.take(), &mut transcriber) {
+                    request_latex(t, out, (cw, ch), (bw, bh), force);
+                }
+                let page = transcriber
+                    .as_ref()
+                    .filter(|_| latex_view)
+                    .and_then(|t| t.page.as_ref());
                 // The memory changes slowly (half-second fades), so ~10 Hz enhancement looks the same and
                 // costs a third as much at 30 fps; I'm drawn over it every frame.
-                if enhancer.look == enhance::Look::Plain
-                    || last_enhance.elapsed() >= Duration::from_millis(90)
+                // (Not needed at all while the LaTeX page is shown.)
+                if page.is_none()
+                    && (enhancer.look == enhance::Look::Plain
+                        || last_enhance.elapsed() >= Duration::from_millis(90))
                 {
                     enhancer.apply(out, &mut enhanced);
                     last_enhance = Instant::now();
                 }
-                g.overlay(&enhanced, &board, out);
+                g.overlay(page.unwrap_or(&enhanced), &board, out);
                 &*out
             }
             None => {
-                enhancer.apply(&board, &mut enhanced);
-                &enhanced
+                if let (Some(force), Some(t)) = (want_latex.take(), &mut transcriber) {
+                    request_latex(t, &board, (cw, ch), (bw, bh), force);
+                }
+                let page = transcriber
+                    .as_ref()
+                    .filter(|_| latex_view)
+                    .and_then(|t| t.page.as_ref());
+                match page {
+                    Some(p) => p,
+                    None => {
+                        enhancer.apply(&board, &mut enhanced);
+                        &enhanced
+                    }
+                }
             }
         };
         rgb_to_yuyv(shown, &mut board_yuyv);
@@ -726,6 +837,8 @@ fn run(
                 raw: raw_out.as_ref().map(|(s, _, _, w)| feed(s, w)),
                 look: enhancer.look,
                 ghost: ghost.as_ref().map(|(_, g, _)| g.opacity()),
+                latex: transcriber.as_ref(),
+                latex_view,
                 tracker: tracker.as_ref(),
                 perf,
                 started,

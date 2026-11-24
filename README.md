@@ -72,11 +72,30 @@ cargo run --release -- --look paper           # dark ink on white (also: natural
 `snap` averages 16 frames and writes every look: `raw.png`, `board.png`, `board_natural.png`, `board_paper.png`.
 
 **Status display.** In a terminal, boardvu shows a full-screen status: the feeds (and whether anything is watching
-them), the look and ghost, board tracking, frame rate and CPU, and a log. `--no-tui` (or running without a terminal)
+them), the look, ghost and LaTeX view, board tracking, the LaTeX view's cost (last transcription, session total,
+and an estimate per transcription), frame rate and CPU, and a log. `--no-tui` (or running without a terminal)
 prints plain log lines instead.
 
 **Keys while streaming:** `l` cycles the look (plain → natural → paper), `g` steps me through hidden → ghost 0.1 → ghost 0.25 → opaque (fully
-shown, no ghosting). `q`, Esc or Ctrl-C stops.
+shown, no ghosting), `t` toggles the
+LaTeX view, `r` re-transcribes. `q`, Esc or Ctrl-C stops.
+
+### LaTeX view (`t`)
+
+The board, typeset: `t` sends the board (in the paper look, from the board memory, so without me in it) to an
+OpenAI vision model, which writes it as LaTeX with the drawings redrawn in TikZ; pdflatex typesets it and the page
+replaces the chalk in the feed (my ghost is still drawn over it). The video keeps running while it works (~15 s
+with `gpt-6-luna` at low effort). `t` again goes back to the chalk; turning it on again reuses the page if the board
+hasn't changed, and `r` forces a fresh transcription.
+
+- Needs `OPENAI_API_KEY` in the environment or as a line in `~/.tokens` (only that line is read), and `pdflatex` +
+  `pdftoppm`. Without them boardvu runs as normal with the LaTeX view off. `--no-latex` turns it off.
+- Cost: about 1.3k tokens in and 1-3k out per transcription, roughly $0.001 at luna's $0.10/$0.50 per million
+  tokens. Set `--latex-price-in/--latex-price-out` if prices change; the session total is printed after each one.
+- `--latex-model`, `--latex-effort` (none, low, medium, high: medium reads messy writing better but takes ~40 s).
+- Each transcription is kept in `out/latex/<unix time>/` (`input.png`, `board.tex`, `board.pdf`). If pdflatex
+  rejects the model's LaTeX, the error goes back to the model once for a fix.
+- pdflatex runs without shell escape and with kpathsea's paranoid file access, since the `.tex` is model output.
 
 ### Looks
 
