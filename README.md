@@ -1,9 +1,41 @@
-# boardvu
+<h1 align="center">boardvu</h1>
 
-**A virtual camera of your blackboard, for video calls.** Point an ordinary webcam at a blackboard and boardvu gives
-your meeting app a new camera that shows just the board: straightened out, evenly lit, with the chalk boosted. When
-you stand in front of it, you're drawn as a faint **ghost** over what was written behind you, so people can still
-read the board.
+<p align="center">
+  <b>A virtual camera of your blackboard, for video calls.</b><br>
+  Straightened, evenly lit, chalk boosted, and with you as a see-through ghost so the writing stays readable.
+</p>
+
+<p align="center">
+  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-blue.svg"></a>
+  <img alt="Platform: Linux" src="https://img.shields.io/badge/platform-Linux-lightgrey.svg">
+  <img alt="Written in Rust" src="https://img.shields.io/badge/rust-2024-orange.svg">
+  <img alt="No GPU needed" src="https://img.shields.io/badge/GPU-not%20needed-green.svg">
+</p>
+
+Teaching on a blackboard over a video call usually means a skewed, dim view of the board, with you standing in front
+of the bit everyone is trying to read. boardvu sits between your webcam and your meeting app. It gives the app a new
+camera that shows just the board: cut out, flattened, and cleaned up. When you step in front of the board, the
+writing behind you stays visible, and you're drawn over it as a faint ghost.
+
+```mermaid
+flowchart LR
+    cam["Webcam<br/>(MJPEG)"] --> deskew["Deskew<br/>the board"]
+    cam --> seg["Find you<br/>(segmentation)"]
+    deskew --> mem["Board memory<br/>(updated where<br/>you aren't)"]
+    seg --> mem
+    mem --> enh["Even out lighting,<br/>boost chalk"]
+    enh --> ghost["Draw you<br/>as a ghost"]
+    ghost --> board[["boardvu board<br/>/dev/video11"]]
+    cam --> raw[["boardvu raw<br/>/dev/video10"]]
+    board --> app(["Zoom, Meet,<br/>Teams, OBS…"])
+    raw --> app
+```
+
+**Contents:** [Features](#features) · [Requirements](#requirements) · [Quick start](#quick-start) ·
+[Using it](#using-it) · [Configuration](#configuration) · [How it works](#how-it-works) ·
+[Troubleshooting](#troubleshooting) · [License](#license)
+
+## Features
 
 - **Deskew**: the board is cut out of the camera picture and flattened to a rectangle, at the full resolution the
   camera can see it.
@@ -18,8 +50,8 @@ read the board.
   setting for you.
 - **Board light** (optional): turns a Home Assistant light on while it runs and off when it stops.
 
-It also passes the webcam through unchanged as a second virtual camera, so you can switch between the board and a
-normal view in your meeting app.
+- **Two cameras**: the webcam is also passed through unchanged, so you can switch between the board and a normal
+  view in your meeting app.
 
 | Virtual camera  | Device         | What                                    |
 |-----------------|----------------|-----------------------------------------|
@@ -37,6 +69,9 @@ normal view in your meeting app.
 - **Rust** (edition 2024; install with [rustup](https://rustup.rs)) and `curl`. The optional pose model also needs
   [uv](https://docs.astral.sh/uv/).
 - A few CPU cores: ghost mode uses about 2–2.5 cores at 15 fps. No GPU needed.
+
+**Tested with** an Anker PowerConf C200 (2560×1440 MJPEG, mounted on its side) and a green chalkboard in an aluminium
+frame, on Ubuntu with v4l2loopback 0.12.7. Other webcams and boards should work; reports are welcome in the issues.
 
 ## Quick start
 
@@ -70,11 +105,15 @@ This writes a starting config to `~/.config/boardvu/board.json`, and `setup.png`
 pixel grid over it.
 
 **5. Find the board.** Open `setup.png`, read off the board's four corners roughly (to within about 50 px), and pass
-them in order: the board's top-left first, then clockwise (top-right, bottom-right, bottom-left).
+them in order: the board's top-left first, then clockwise (top-right, bottom-right, bottom-left). For example:
 
 ```sh
-boardvu calibrate --from "960,200 1790,195 1805,800 965,820"
+boardvu calibrate --from "960,200 1790,195 1805,800 965,820"   # use your own numbers
 ```
+
+> [!TIP]
+> If the camera is on its side, the picture in `setup.png` is sideways. List the corners starting from **the
+> board's** top-left, wherever that ends up in the picture.
 
 boardvu finds the exact edges of the board near those points, saves them, and writes `calib.png` with the result
 outlined in green. Check it.
@@ -93,7 +132,10 @@ boardvu
 
 In your meeting app, pick the camera called **boardvu board**. Press `q` (or Ctrl-C) to stop.
 
-`boardvu snap out/` saves a still of the board in each look, which is handy to check the setup without a meeting.
+> [!NOTE]
+> The virtual cameras only appear in meeting apps while boardvu is running.
+
+To check the setup without a meeting, `boardvu snap out/` saves a still of the board in each look.
 
 ## Using it
 
@@ -192,22 +234,19 @@ boardvu calibrate --from "x,y x,y x,y x,y"   # start from rough corners (top-lef
 boardvu calibrate --set "x,y x,y x,y x,y"    # manual fallback: use exactly these corners, no detection
 ```
 
-Along each edge of the starting outline, boardvu looks across the edge for the strongest step from dark board to
-bright frame. It fits a line to each edge with RANSAC, so sticky notes on the edge, a person in front of it, or chalk
-near it are ignored, and intersects the lines to get the corners. `calib.png` shows the new outline in green and the
+`calib.png` shows the new outline in green and the
 previous one in orange. boardvu refuses to save an outline that can't be the board (a corner outside the picture, a
 shape that isn't board-like, or an edge suddenly 1.6× longer or shorter), for example when part of the board is out
 of view and a straight chalk line looks like an edge. It prints the rejected corners so you can accept them with
 `--set` if `calib.png` shows they're right.
 
-**While streaming**, boardvu re-checks the edges every 2 s (an average of 8 frames, ±15 px). If three checks in a
-row agree that the board has moved by more than 2 px, it re-aligns, restarts the board memory, and saves the new
-corners. The output size stays the same, so meeting apps don't notice. If the board moved further than that, it
-prints a hint to run `calibrate`. `--no-track` turns this off.
+**While streaming**, boardvu follows small camera bumps by itself (see [How it works](#how-it-works)). If the board
+moved further than tracking can follow, it prints a hint to run `calibrate`. `--no-track` turns tracking off.
 
 ## How it works
 
-**Ghost mode.**
+<details>
+<summary><b>Ghost mode</b>: remembering the board behind you</summary>
 
 - A worker thread runs [Robust Video Matting](https://github.com/PeterL1n/RobustVideoMatting) on a 512×288 copy of
   the newest frame, at most 10 times a second (about 55 ms each on a CPU). It publishes the newest matte, and the
@@ -220,11 +259,31 @@ prints a hint to run `calibrate`. `--no-track` turns this off.
   second.
 - Output: the memory, with the live frame blended in at `--ghost-opacity` where the matte says there's a person.
 
-**Chalk enhancement.** Chalk is found with a white top-hat, which is the image minus its morphological opening and
+</details>
+
+<details>
+<summary><b>Chalk enhancement</b>: evening out the light</summary>
+
+Chalk is found with a white top-hat, which is the image minus its morphological opening and
 keeps only bright strokes thinner than about 11 px. Large bright areas like sticky notes and haze therefore aren't
 treated as ink. Lighting is estimated as a coarse median, refreshed twice a second, and divided out, with the gain
 capped at 3× so unlit corners don't turn to noise. In ghost mode, enhancement runs at about 10 Hz on the slowly
 changing board memory, and you're drawn on top every frame.
+
+</details>
+
+<details>
+<summary><b>Finding the board</b>: calibration and tracking</summary>
+
+Along each edge of the starting outline, boardvu looks across the edge for the strongest step from dark board to
+bright frame. It fits a line to each edge with RANSAC, so sticky notes on the edge, a person in front of it, or chalk
+near it are ignored, and intersects the lines to get the corners.
+
+While streaming, boardvu re-checks the edges every 2 s (an average of 8 frames, ±15 px). If three checks in a row
+agree that the board has moved by more than 2 px, it re-aligns, restarts the board memory, and saves the new
+corners. The output size stays the same, so meeting apps don't notice.
+
+</details>
 
 **Cost.** The raw feed is only produced while another program has it open (checked once a second), so it costs
 nothing when unused. Typical CPU at 15 fps is about 2.2 cores, or 2.65 with the raw feed being watched.
@@ -247,6 +306,9 @@ Reload the module with `scripts/loopback.sh`.
 ones with `--from`, or widen `--search`. As a last resort, set the corners by hand with `--set`.
 
 ### Loading v4l2loopback at boot
+
+<details>
+<summary>The module options, and how to load it at every boot</summary>
 
 `scripts/loopback.sh` (re)loads the module with these options:
 
@@ -271,6 +333,8 @@ echo 'options v4l2loopback devices=2 video_nr=10,11 card_label="boardvu raw","bo
 ```
 
 If you change the device numbers, pass them to boardvu with `--raw` and `--board`.
+
+</details>
 
 ## License
 
