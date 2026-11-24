@@ -25,10 +25,13 @@ pub struct Head {
     pub width: Option<f32>,
 }
 
-/// What pose found of me (in `Pose::run`'s frame pixels).
+/// What pose found of me: head, and my arms (to find my hands for the pointer). In `Pose::run`'s frame pixels.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Person {
     pub head: Option<Head>,
+    /// [left, right] (my left and right).
+    pub wrists: [Option<[f32; 2]>; 2],
+    pub elbows: [Option<[f32; 2]>; 2],
 }
 
 pub struct Pose {
@@ -105,12 +108,22 @@ impl Pose {
             return Err(anyhow!("unexpected pose output shape {shape}"));
         }
         let n = shape[2] as usize;
+        let scale = |p: [f32; 2]| [p[0] * kx, p[1] * ky];
         Ok(Person {
             head: best_head(data, n).map(|h| Head {
                 x: h.x * kx,
                 y: h.y * ky,
                 width: h.width.map(|w| w * kx),
             }),
+            // COCO: 9/10 = left/right wrist, 7/8 = left/right elbow.
+            wrists: [
+                keypoint(data, n, 9).map(scale),
+                keypoint(data, n, 10).map(scale),
+            ],
+            elbows: [
+                keypoint(data, n, 7).map(scale),
+                keypoint(data, n, 8).map(scale),
+            ],
         })
     }
 }
@@ -119,6 +132,14 @@ impl Pose {
 const SEEN: f32 = 0.5;
 /// Person score needed.
 const PERSON: f32 = 0.5;
+
+/// Keypoint `k` of the most confident person, if both are confident enough.
+fn keypoint(out: &[f32], n: usize, k: usize) -> Option<[f32; 2]> {
+    let at = |c: usize, i: usize| out[c * n + i];
+    let best = (0..n).max_by(|&a, &b| at(4, a).total_cmp(&at(4, b)))?;
+    (at(4, best) >= PERSON && at(7 + 3 * k, best) >= SEEN)
+        .then(|| [at(5 + 3 * k, best), at(6 + 3 * k, best)])
+}
 
 /// From the [56, n] output (box cx, cy, w, h, score, then 17 keypoints x, y, conf; channel-major): the most
 /// confident person's head.

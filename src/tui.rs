@@ -42,6 +42,8 @@ pub struct Status<'a> {
     /// Board light state; None without light control.
     pub light: Option<String>,
     pub focus: String,
+    /// Left-hand pointer state; None without ghost mode.
+    pub pointer: Option<String>,
     pub tracker: Option<&'a Tracker>,
     pub perf: Perf,
     pub started: Instant,
@@ -139,7 +141,7 @@ fn ago(t: Instant) -> String {
 fn render(f: &mut ratatui::Frame, s: &Status) {
     let [title, top, mid, log, keys] = Layout::vertical([
         Constraint::Length(1),
-        Constraint::Length(7),
+        Constraint::Length(8),
         Constraint::Length(6),
         Constraint::Min(3),
         Constraint::Length(1),
@@ -245,6 +247,10 @@ fn render(f: &mut ratatui::Frame, s: &Status) {
         Some(d) => kv("light", vec![dot(!d.starts_with("off")), d.clone().into()]),
     });
     lines.push(kv("focus", s.focus.clone()));
+    lines.push(match &s.pointer {
+        None => kv("pointer", "needs ghost mode and the hand model".dark_gray()),
+        Some(d) => kv("pointer", vec![dot(d != "off"), d.clone().into()]),
+    });
     f.render_widget(Paragraph::new(lines).block(block("view")), view);
 
     let p = s.perf;
@@ -304,6 +310,7 @@ fn render(f: &mut ratatui::Frame, s: &Status) {
         ("k", "colour"),
         ("f", "focus"),
         (",.", "adjust"),
+        ("w", "pointer"),
         ("q", "quit"),
     ] {
         spans.extend(key(k, w));

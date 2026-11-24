@@ -47,6 +47,7 @@ then exits. Reload the module with `scripts/loopback.sh`.
 ```sh
 scripts/fetch-model.sh       # models/rvm_mobilenetv3_fp32.onnx, Robust Video Matting (GPL-3.0)
 scripts/fetch-pose-model.sh  # models/yolo11n-pose.onnx, for the picture-in-picture (optional; needs uv)
+scripts/fetch-hand-model.sh  # models/hand_landmarks.onnx, for the pointer (optional; needs uv)
 ```
 
 The pose model (Ultralytics YOLO11n-pose, AGPL-3.0, so not committed here) finds my head for the
@@ -84,12 +85,19 @@ them), the look and ghost, board tracking, frame rate and CPU, and a log. `--no-
 prints plain log lines instead.
 
 **Keys while streaming:** `l` cycles the look (plain → natural → paper), `g` steps me through hidden → ghost 0.1 → ghost 0.25 → ghost 0.5 → opaque (fully
-shown, no ghosting). `p` toggles a picture-in-picture of me, `o` moves it to the next corner. `b`, `-`/`=` and `k` control the board light (see above). `q`, Esc or Ctrl-C stops.
+shown, no ghosting). `p` toggles a picture-in-picture of me, `o` moves it to the next corner. `w` toggles the pointer. `b`, `-`/`=` and `k` control the board light (see above). `q`, Esc or Ctrl-C stops.
 
 **Focus.** Autofocus locks onto whoever is in front of the board, so boardvu normally holds the lens at the board's
 focus from `board.json`. `f` switches between that and autofocus. `,` / `.` move the board focus nearer / further by
 hand, and the value is saved to `board.json` a couple of seconds after it stops changing. With no focus saved yet,
 let autofocus find the board (stand aside) and press `f` to lock it there.
+
+**Pointer.** Point at the board with an index finger (either hand) and a red dot appears on the feed where I'm
+pointing. Pose finds my arms; MediaPipe's hand landmark model (Apache-2.0) then tracks each hand on a crop of the
+full-resolution frame (the hands take turns, ~10 Hz each) and gives the fingertip, which is mapped onto the board
+with the inverse of the board warp. The dot only shows while I'm pointing (index out, other fingers curled), stays on
+one hand while it keeps pointing, and `--pointer-always` shows it whenever a hand is over the board. It needs the
+hand model (no fallback). `--pointer` starts with it on.
 
 **Picture-in-picture.** A squircle crop of me, inset in a corner of the board feed (same resolution, so meeting
 apps don't notice it coming and going). It follows my head (found by the pose model, or the person matte; either way it needs ghost
