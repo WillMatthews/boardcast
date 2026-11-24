@@ -89,7 +89,10 @@ shown, no ghosting). `p` toggles a picture-in-picture of me, `o` moves it to the
 **Focus.** Autofocus locks onto whoever is in front of the board, so boardvu normally holds the lens at the board's
 focus from `board.json`. `f` switches between that and autofocus. `,` / `.` move the board focus nearer / further by
 hand, and the value is saved to `board.json` a couple of seconds after it stops changing. With no focus saved yet,
-let autofocus find the board (stand aside) and press `f` to lock it there.
+let autofocus find the board (stand aside) and press `f` to lock it there. `boardvu focus` finds the best board focus for you: stand
+aside and it sweeps the lens, scores how sharp the deskewed board is at each step, and saves the sharpest (about half a
+minute; `--dry-run` to only report). The status display shows the live sharpness score next to the focus, handy for
+comparing light levels and camera settings (compare in the same light; in-camera sharpening inflates it).
 
 **Picture-in-picture.** A squircle crop of me, inset in a corner of the board feed (same resolution, so meeting
 apps don't notice it coming and going). It follows my head (found by the pose model, or the person matte; either way it needs ghost

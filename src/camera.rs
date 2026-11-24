@@ -76,6 +76,11 @@ impl Camera {
         })
     }
 
+    /// focus_absolute's (min, max), if the camera reports it.
+    pub fn focus_range(&self) -> Option<(i64, i64)> {
+        self.focus_range
+    }
+
     pub fn focus(&self) -> Focus {
         self.focus
     }

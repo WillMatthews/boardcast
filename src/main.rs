@@ -13,6 +13,7 @@ mod pip;
 mod pose;
 mod secrets;
 mod segment;
+mod sharp;
 mod track;
 mod tui;
 
@@ -66,6 +67,13 @@ enum Cmd {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Find the sharpest focus for the board by sweeping the lens, and save it to the config. Stand aside while it
+    /// runs (about half a minute).
+    Focus {
+        /// Report only; don't save.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Debug: time person segmentation on live frames and save the last matte.
     #[command(hide = true)]
     SegBench {
@@ -85,6 +93,12 @@ enum Cmd {
 
 #[derive(Args)]
 struct Common {
+    /// Light control config (Home Assistant). Missing file = no light control.
+    #[arg(long, global = true, default_value = concat!(env!("CARGO_MANIFEST_DIR"), "/light.json"))]
+    light: PathBuf,
+    /// Leave the board light alone.
+    #[arg(long, global = true)]
+    no_light: bool,
     /// Real webcam.
     #[arg(long, default_value = "/dev/video0")]
     cam: String,
@@ -150,12 +164,6 @@ struct RunArgs {
     /// Threads for the per-frame image work (warp, ghost, colour conversion).
     #[arg(long, default_value_t = 4)]
     threads: usize,
-    /// Light control config (Home Assistant). Missing file = no light control.
-    #[arg(long, default_value = concat!(env!("CARGO_MANIFEST_DIR"), "/light.json"))]
-    light: PathBuf,
-    /// Leave the board light alone.
-    #[arg(long)]
-    no_light: bool,
     /// Start with the picture-in-picture of me showing (toggle with `p`; needs ghost mode's segmentation).
     #[arg(long)]
     pip: bool,
@@ -340,6 +348,13 @@ fn main() -> Result<()> {
         };
         return seg_bench(&mut *source, (fw, fh), dir, *res, *ratio, *threads);
     }
+    // Light first, so the camera's auto-exposure settles on the lit board (calibration and focus need it too).
+    // Dropped (light off) on any exit.
+    let light = if cli.common.no_light {
+        None
+    } else {
+        light::Light::start(&cli.common.light)?
+    };
     if let Some(Cmd::Calibrate {
         dir,
         search,
@@ -358,6 +373,13 @@ fn main() -> Result<()> {
 
     match cli.cmd.unwrap_or(Cmd::Run) {
         Cmd::Snap { dir } => snap(&mut cam, &board_map, &cfg, &dir),
+        Cmd::Focus { dry_run } => focus_sweep(
+            &mut cam,
+            &board_map,
+            board_rect((cw, ch), (bw, bh)),
+            &cli.common.config,
+            dry_run,
+        ),
         Cmd::SegBench { .. } | Cmd::Calibrate { .. } => unreachable!("handled above"),
         Cmd::Run => run(
             &mut cam,
@@ -366,8 +388,105 @@ fn main() -> Result<()> {
             &cli.common.config,
             ((cw, ch), (bw, bh)),
             &cli.run,
+            light,
+            &cli.common.light,
         ),
     }
+}
+
+/// Where the board sits in the canvas: (x, y, w, h).
+fn board_rect((cw, ch): (usize, usize), (bw, bh): (usize, usize)) -> (usize, usize, usize, usize) {
+    ((cw - bw) / 2, (ch - bh) / 2, bw, bh)
+}
+
+/// Board sharpness at focus `v`: let the lens settle, then score an average of a few frames (averaging cuts the
+/// noise, which would otherwise count as detail).
+fn score_focus(
+    cam: &mut Camera,
+    map: &ResampleMap,
+    rect: (usize, usize, usize, usize),
+    v: i64,
+) -> Result<f32> {
+    let mut frame = Rgb::new(cam.w, cam.h);
+    cam.set_focus(Focus::Fixed(v));
+    let t = Instant::now();
+    while t.elapsed() < Duration::from_millis(450) {
+        cam.next_into(&mut frame)?;
+    }
+    const N: u32 = 4;
+    let mut board = Rgb::new(map.out_w, map.out_h);
+    let mut sum = vec![0u32; board.data.len()];
+    for _ in 0..N {
+        cam.next_into(&mut frame)?;
+        map.apply(&frame, &mut board);
+        for (s, &b) in sum.iter_mut().zip(&board.data) {
+            *s += b as u32;
+        }
+    }
+    for (b, s) in board.data.iter_mut().zip(&sum) {
+        *b = ((s + N / 2) / N) as u8;
+    }
+    Ok(sharp::sharpness(&board, rect))
+}
+
+fn focus_sweep(
+    cam: &mut Camera,
+    map: &ResampleMap,
+    rect: (usize, usize, usize, usize),
+    config: &Path,
+    dry_run: bool,
+) -> Result<()> {
+    let (lo, hi) = cam
+        .focus_range()
+        .context("the camera doesn't report a focus range")?;
+    let mut frame = Rgb::new(cam.w, cam.h);
+    for _ in 0..30 {
+        cam.next_into(&mut frame)?; // let exposure settle
+    }
+    let mut results: Vec<(i64, f32)> = Vec::new();
+    let mut sweep = |vs: Vec<i64>, results: &mut Vec<(i64, f32)>| -> Result<()> {
+        for v in vs {
+            if results.iter().any(|r| r.0 == v) {
+                continue;
+            }
+            let s = score_focus(cam, map, rect, v)?;
+            eprintln!("  focus {v:4}  sharpness {s:6.2}");
+            results.push((v, s));
+        }
+        Ok(())
+    };
+    eprintln!("coarse sweep {lo}..{hi} (stand aside):");
+    let coarse = (hi - lo) / 20;
+    sweep(
+        (lo..=hi).step_by(coarse.max(1) as usize).collect(),
+        &mut results,
+    )?;
+    let best = |r: &[(i64, f32)]| {
+        r.iter()
+            .copied()
+            .max_by(|a, b| a.1.total_cmp(&b.1))
+            .unwrap()
+    };
+    let (b, _) = best(&results);
+    eprintln!("fine sweep around {b}:");
+    let fine = (coarse / 5).max(1);
+    sweep(
+        ((b - coarse).max(lo)..=(b + coarse).min(hi))
+            .step_by(fine as usize)
+            .collect(),
+        &mut results,
+    )?;
+    let (b, s) = best(&results);
+    // The lens may not return exactly (backlash): check the winner again from the same direction as the sweep.
+    let again = score_focus(cam, map, rect, b)?;
+    eprintln!("best focus {b} (sharpness {s:.2}; {again:.2} on a second look)");
+    if dry_run {
+        eprintln!("dry run: not saved");
+    } else {
+        save_focus(config, b)?;
+        eprintln!("saved focus {b} to {}", config.display());
+    }
+    Ok(())
 }
 
 fn snap(cam: &mut Camera, board_map: &ResampleMap, cfg: &Config, dir: &Path) -> Result<()> {
@@ -455,6 +574,10 @@ fn calibrate_cmd(
                     (fit.min_support() < 0.35).then(|| "an edge is poorly supported".to_string())
                 });
             if let Some(why) = problem {
+                eprintln!(
+                    "rejected fit (if calib.png shows it right, accept it with --set): \"{}\"",
+                    fit.corners.map(|[x, y]| format!("{x:.1},{y:.1}")).join(" ")
+                );
                 std::fs::create_dir_all(dir)?;
                 draw_quad(&mut frame, &start, [255, 160, 0]);
                 draw_quad(&mut frame, &fit.corners, [255, 0, 0]);
@@ -561,17 +684,16 @@ fn run(
     config_path: &Path,
     dims: ((usize, usize), (usize, usize)),
     args: &RunArgs,
+    mut light: Option<light::Light>,
+    light_config: &Path,
 ) -> Result<()> {
     let ((cw, ch), (bw, bh)) = dims;
-    // Light first, so the camera's auto-exposure settles on the lit board. Dropped (light off) on any exit.
-    let mut light = if args.no_light {
-        None
-    } else {
-        light::Light::start(&args.light)?
-    };
     // The board's focus: `f` switches between it and autofocus; `,` / `.` adjust it (saved to the config).
     let mut board_focus = cfg.focus;
     let mut focus_dirty: Option<Instant> = None;
+    // Live board sharpness (of the raw deskewed frame), refreshed once a second.
+    let mut sharpness: Option<f32> = None;
+    let mut last_sharpness = Instant::now();
     // Sizes are given landscape; a camera on its side gives portrait upright pictures.
     let seg_res = image::upright_size(args.seg_res, cfg.rotate);
     let mut ghost = if args.no_ghost {
@@ -701,6 +823,10 @@ fn run(
             }
         }
         board_map.apply(&frame, &mut board);
+        if last_sharpness.elapsed() >= Duration::from_secs(1) {
+            last_sharpness = Instant::now();
+            sharpness = Some(sharp::sharpness(&board, board_rect((cw, ch), (bw, bh))));
+        }
         if args.test_flash {
             board.data.fill(if n % 2 == 0 { 0 } else { 255 });
         }
@@ -738,7 +864,7 @@ fn run(
                 b'b' | b'-' | b'=' | b'+' | b'k' if light.is_none() => {
                     say!(
                         "no board light ({} missing, or --no-light)",
-                        args.light.display()
+                        light_config.display()
                     )
                 }
                 b'b' => {
@@ -873,6 +999,7 @@ fn run(
                 ghost: ghost.as_ref().map(|(_, g, _)| g.opacity()),
                 pip: ghost.as_ref().map(|_| pip.describe()),
                 light: light.as_ref().map(|l| l.describe()),
+                sharpness,
                 focus: match cam.focus() {
                     Focus::Auto => "auto".into(),
                     Focus::Fixed(v) if Some(v) == board_focus => format!("board ({v})"),

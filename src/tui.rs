@@ -42,6 +42,8 @@ pub struct Status<'a> {
     /// Board light state; None without light control.
     pub light: Option<String>,
     pub focus: String,
+    /// Board sharpness (see `sharp`), when measured.
+    pub sharpness: Option<f32>,
     pub tracker: Option<&'a Tracker>,
     pub perf: Perf,
     pub started: Instant,
@@ -244,7 +246,13 @@ fn render(f: &mut ratatui::Frame, s: &Status) {
         None => kv("light", "not controlled".dark_gray()),
         Some(d) => kv("light", vec![dot(!d.starts_with("off")), d.clone().into()]),
     });
-    lines.push(kv("focus", s.focus.clone()));
+    lines.push(kv(
+        "focus",
+        match s.sharpness {
+            Some(v) => format!("{}, sharpness {v:.1}", s.focus),
+            None => s.focus.clone(),
+        },
+    ));
     f.render_widget(Paragraph::new(lines).block(block("view")), view);
 
     let p = s.perf;
