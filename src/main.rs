@@ -604,7 +604,7 @@ fn run(
     let keys = tui.is_none().then(keys::Keys::start);
     if tui.is_none() {
         say!(
-            "look: {:?} | keys: l = cycle look (plain/natural/paper), g = ghost (hidden/0.1/0.25/opaque)",
+            "look: {:?} | keys: l = cycle look (plain/natural/paper), g = ghost (hidden/0.1/0.25/0.5/opaque)",
             args.look
         );
     }

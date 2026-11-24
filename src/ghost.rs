@@ -22,8 +22,8 @@ use rayon::prelude::*;
 use crate::image::{ROWS_PER_TASK, ResampleMap, Rgb};
 use crate::segment::Matting;
 
-/// What `g` steps through: hidden, faint, the default ghost, and opaque (me fully drawn, no ghosting).
-pub const OPACITY_STEPS: [f32; 4] = [0.0, 0.1, 0.25, 1.0];
+/// What `g` steps through: hidden, faint, the default ghost, half, and opaque (me fully drawn, no ghosting).
+pub const OPACITY_STEPS: [f32; 5] = [0.0, 0.1, 0.25, 0.5, 1.0];
 
 /// The next step after `current` (wrapping to hidden after opaque; a custom --ghost-opacity joins at the next step up).
 pub fn next_opacity(current: f32) -> f32 {
@@ -479,12 +479,12 @@ mod tests {
     fn g_cycles_hidden_faint_ghost_opaque() {
         let mut o = 0.25; // the default
         let mut seen = Vec::new();
-        for _ in 0..5 {
+        for _ in 0..6 {
             o = next_opacity(o);
             seen.push(o);
         }
-        assert_eq!(seen, [1.0, 0.0, 0.1, 0.25, 1.0]);
-        assert_eq!(next_opacity(0.4), 1.0); // a custom --ghost-opacity
+        assert_eq!(seen, [0.5, 1.0, 0.0, 0.1, 0.25, 0.5]);
+        assert_eq!(next_opacity(0.4), 0.5); // a custom --ghost-opacity
     }
 
     #[test]

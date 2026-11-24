@@ -75,7 +75,7 @@ cargo run --release -- --look paper           # dark ink on white (also: natural
 them), the look and ghost, board tracking, frame rate and CPU, and a log. `--no-tui` (or running without a terminal)
 prints plain log lines instead.
 
-**Keys while streaming:** `l` cycles the look (plain → natural → paper), `g` steps me through hidden → ghost 0.1 → ghost 0.25 → opaque (fully
+**Keys while streaming:** `l` cycles the look (plain → natural → paper), `g` steps me through hidden → ghost 0.1 → ghost 0.25 → ghost 0.5 → opaque (fully
 shown, no ghosting). `q`, Esc or Ctrl-C stops.
 
 ### Looks

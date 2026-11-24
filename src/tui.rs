@@ -216,6 +216,7 @@ fn render(f: &mut ratatui::Frame, s: &Status) {
                 step(0.0, "hidden"),
                 step(0.1, "0.1"),
                 step(0.25, "0.25"),
+                step(0.5, "0.5"),
                 step(1.0, "opaque"),
             ];
             if !crate::ghost::OPACITY_STEPS
