@@ -34,6 +34,34 @@ struct Tap {
 }
 
 /// A fixed geometric mapping output pixel -> source position, computed once and applied per frame.
+/// Size of a `(w, h)` picture turned `rot` degrees clockwise.
+pub fn upright_size((w, h): (usize, usize), rot: u32) -> (usize, usize) {
+    if rot % 180 == 90 { (h, w) } else { (w, h) }
+}
+
+/// A point in a `(w, h)` picture (continuous coordinates, pixel edges on integers) -> the same point after turning
+/// the picture `rot` degrees clockwise.
+pub fn to_upright([x, y]: [f64; 2], (w, h): (usize, usize), rot: u32) -> [f64; 2] {
+    let (w, h) = (w as f64, h as f64);
+    match rot {
+        90 => [h - y, x],
+        180 => [w - x, h - y],
+        270 => [y, w - x],
+        _ => [x, y],
+    }
+}
+
+/// Inverse of `to_upright`.
+pub fn from_upright([u, v]: [f64; 2], (w, h): (usize, usize), rot: u32) -> [f64; 2] {
+    let (w, h) = (w as f64, h as f64);
+    match rot {
+        90 => [v, h - u],
+        180 => [w - u, h - v],
+        270 => [w - v, u],
+        _ => [u, v],
+    }
+}
+
 pub struct ResampleMap {
     pub out_w: usize,
     pub out_h: usize,
@@ -121,9 +149,20 @@ impl ResampleMap {
 
     /// Plain rescale of the whole frame (for the raw passthrough).
     pub fn scale(src_w: usize, src_h: usize, out_w: usize, out_h: usize) -> Self {
-        let (kx, ky) = (src_w as f64 / out_w as f64, src_h as f64 / out_h as f64);
+        Self::upright(src_w, src_h, out_w, out_h, 0)
+    }
+
+    /// Scale the source, turned `rot` degrees clockwise first (0, 90, 180, 270): for a camera mounted on its side.
+    pub fn upright(src_w: usize, src_h: usize, out_w: usize, out_h: usize, rot: u32) -> Self {
+        let (uw, uh) = upright_size((src_w, src_h), rot);
+        let (kx, ky) = (uw as f64 / out_w as f64, uh as f64 / out_h as f64);
         Self::build(out_w, out_h, src_w, src_h, [0; 3], |x, y| {
-            Some([(x as f64 + 0.5) * kx - 0.5, (y as f64 + 0.5) * ky - 0.5])
+            let [cx, cy] = from_upright(
+                [(x as f64 + 0.5) * kx, (y as f64 + 0.5) * ky],
+                (src_w, src_h),
+                rot,
+            );
+            Some([cx - 0.5, cy - 0.5])
         })
     }
 
@@ -208,6 +247,23 @@ pub fn rgb_to_yuyv(src: &Rgb, dst: &mut [u8]) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn upright_round_trips_and_turns_clockwise() {
+        for rot in [0, 90, 180, 270] {
+            let p = [3.0, 1.0];
+            let q = super::to_upright(p, (8, 6), rot);
+            assert_eq!(super::from_upright(q, (8, 6), rot), p, "rot {rot}");
+        }
+        // Turning clockwise, the picture's left edge becomes the top.
+        assert_eq!(super::to_upright([0.0, 6.0], (8, 6), 90), [0.0, 0.0]);
+        // Pixel (0, 5) (bottom-left) of an 8x6 picture is pixel (0, 0) of the upright 6x8 one.
+        let mut src = Rgb::new(8, 6);
+        src.data[(5 * 8) * 3] = 200;
+        let mut out = Rgb::new(6, 8);
+        ResampleMap::upright(8, 6, 6, 8, 90).apply(&src, &mut out);
+        assert_eq!(out.data[0], 200);
+    }
+
     use super::*;
 
     #[test]

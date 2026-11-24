@@ -84,6 +84,7 @@ impl Segmenter {
     pub fn start(
         model: &Path,
         (cam_w, cam_h): (usize, usize),
+        rot: u32,
         (w, h): (usize, usize),
         ratio: f32,
         threads: usize,
@@ -132,7 +133,7 @@ impl Segmenter {
         Ok(Segmenter {
             shared,
             thread: Some(thread),
-            down: ResampleMap::scale(cam_w, cam_h, w, h),
+            down: ResampleMap::upright(cam_w, cam_h, w, h, rot),
             spare: Some(Rgb::new(w, h)),
             w,
             h,

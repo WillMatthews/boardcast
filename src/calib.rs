@@ -285,13 +285,56 @@ impl Tracker {
             }
         }
         let consistent = self.recent.iter().all(|c| max_shift(c, &mean) < 1.0);
-        if consistent && max_shift(&mean, &self.corners) > Self::MOVE {
+        let plausible = check_plausible(&mean, (frame.w, frame.h), &self.corners).is_ok();
+        if consistent && plausible && max_shift(&mean, &self.corners) > Self::MOVE {
             self.corners = mean;
             self.recent.clear();
             return Some(mean);
         }
         None
     }
+}
+
+/// Reject outlines that can't be the board: corners outside the camera's view (the board doesn't fit in the
+/// frame, so an edge can't really have been seen), a non-convex or badly skewed quad, or a big change of shape
+/// from `prev`. Without this, a strong straight chalk line can pass for a missing edge.
+pub fn check_plausible(c: &Corners, (w, h): (usize, usize), prev: &Corners) -> Result<(), String> {
+    const MARGIN: f64 = 3.0;
+    const NAMES: [&str; 4] = ["top-left", "top-right", "bottom-right", "bottom-left"];
+    for (i, p) in c.iter().enumerate() {
+        if p[0] < MARGIN || p[1] < MARGIN || p[0] > w as f64 - MARGIN || p[1] > h as f64 - MARGIN {
+            return Err(format!(
+                "the {} corner ({:.0},{:.0}) is outside the camera's view: the whole board must be in the frame",
+                NAMES[i], p[0], p[1]
+            ));
+        }
+    }
+    for i in 0..4 {
+        let (a, b, d) = (c[(i + 3) % 4], c[i], c[(i + 1) % 4]);
+        let (u, v) = ([a[0] - b[0], a[1] - b[1]], [d[0] - b[0], d[1] - b[1]]);
+        let cross = u[0] * v[1] - u[1] * v[0];
+        let dot = u[0] * v[0] + u[1] * v[1];
+        let angle = cross.abs().atan2(dot).to_degrees();
+        if cross > 0.0 || !(55.0..=125.0).contains(&angle) {
+            return Err(format!(
+                "the outline isn't board-shaped (angle at the {} corner is {angle:.0}°)",
+                NAMES[i]
+            ));
+        }
+    }
+    let side = |c: &Corners, i: usize| {
+        let (a, b) = (c[i], c[(i + 1) % 4]);
+        ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2)).sqrt()
+    };
+    for i in 0..4 {
+        let r = side(c, i) / side(prev, i).max(1.0);
+        if !(0.6..=1.6).contains(&r) {
+            return Err(format!(
+                "an edge changed length by {r:.2}x from before; that's not the same board view"
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub fn max_shift(a: &Corners, b: &Corners) -> f64 {
@@ -412,6 +455,35 @@ mod tests {
         let c = check_now(&mut bumped, &img).expect("didn't re-align after 3 agreeing checks");
         assert!(max_shift(&c, &TRUE) < 1.5, "{c:?}");
         assert!(check_now(&mut bumped, &img).is_none(), "re-aligned twice");
+    }
+
+    #[test]
+    fn implausible_outlines_are_rejected() {
+        let frame = (1200, 900);
+        assert!(check_plausible(&TRUE, frame, &TRUE).is_ok());
+        // A corner above the image (the board's top is out of view).
+        let off = [
+            [300.0, -200.0],
+            [880.0, 70.0],
+            [860.0, 760.0],
+            [310.0, 700.0],
+        ];
+        assert!(
+            check_plausible(&off, frame, &TRUE)
+                .unwrap_err()
+                .contains("outside the camera's view")
+        );
+        // A chalk diagonal mistaken for the top edge: badly skewed.
+        let skew = [
+            [300.0, 20.0],
+            [880.0, 500.0],
+            [860.0, 760.0],
+            [310.0, 700.0],
+        ];
+        assert!(check_plausible(&skew, frame, &TRUE).is_err());
+        // Twisted (corners out of order).
+        let twisted = [TRUE[1], TRUE[0], TRUE[2], TRUE[3]];
+        assert!(check_plausible(&twisted, frame, &TRUE).is_err());
     }
 
     #[test]

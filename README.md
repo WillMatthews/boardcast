@@ -111,6 +111,9 @@ resolution), `--raw-size WxH`, `--focus auto|N`, `--cam`, `--raw`, `--board`, `-
 
 - `corners`: TL, TR, BR, BL of the writing surface (inner edge of the aluminium frame) in full-resolution
   (2560×1440) camera pixels.
+- `rotate`: degrees to turn the camera picture clockwise to make it upright (0, 90, 180, 270), for a camera
+  mounted on its side. Corners are always listed in the board's own order (its top-left first), so the board comes
+  out upright; segmentation runs on the upright picture, and the raw feed is upright (portrait, e.g. 1080x1920).
 - `focus`: locked `focus_absolute` (autofocus locks onto my head instead of the board).
 - `aspect`: real board width/height. 0.75 is estimated from the square sticky notes. Measure it to be exact.
 
@@ -123,10 +126,14 @@ cargo run --release -- calibrate --dry-run --dir out/   # find the board, write 
 cargo run --release -- calibrate                        # ...and save the corners to board.json
 cargo run --release -- calibrate --search 250           # the camera moved a lot (default search: 120 px)
 cargo run --release -- calibrate --from "x,y x,y x,y x,y"  # start from a rough guess (TL TR BR BL)
+cargo run --release -- calibrate --search 60 --from "x,y x,y x,y x,y"  # after turning the camera: set
+                                                        # `rotate` first, give rough corners in board order
 cargo run --release -- calibrate --set "x,y x,y x,y x,y"   # manual fallback: use exactly these corners
 ```
 
-`calib.png` shows the new outline in green and the previous one in orange.
+`calib.png` shows the new outline in green and the previous one in orange. It refuses to save an outline that can't be the board (a
+corner outside the picture, not board-shaped, or an edge suddenly 1.6x longer or shorter), e.g. when part of the
+board is out of view and a straight chalk line looks like an edge.
 
 **While streaming** boardvu re-checks the edges every 2 s (average of 8 frames, ±15 px). If three checks in a row
 agree that the board has moved more than 2 px, it re-aligns the warp, restarts the board memory, and saves the

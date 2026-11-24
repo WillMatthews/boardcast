@@ -161,6 +161,10 @@ struct Config {
     focus: Option<i64>,
     /// Real board width / height. Estimated from the corners if absent (perspective makes that a guess).
     aspect: Option<f64>,
+    /// Degrees to turn the camera picture clockwise to make it upright (camera mounted on its side): 0, 90, 180,
+    /// 270. Corners are always listed in the board's own order (its top-left first), whatever the rotation.
+    #[serde(default)]
+    rotate: u32,
 }
 
 const BG: [u8; 3] = [24, 24, 24];
@@ -207,7 +211,14 @@ fn save_corners(path: &Path, corners: &calib::Corners) -> Result<()> {
 fn load_config(path: &Path) -> Result<Config> {
     let text =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))
+    let cfg: Config =
+        serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+    anyhow::ensure!(
+        [0, 90, 180, 270].contains(&cfg.rotate),
+        "rotate must be 0, 90, 180 or 270 (got {})",
+        cfg.rotate
+    );
+    Ok(cfg)
 }
 
 fn dist(a: [f64; 2], b: [f64; 2]) -> f64 {
@@ -397,9 +408,20 @@ fn calibrate_cmd(
                 calib::max_shift(&fit.corners, &start),
                 fit.support.map(|s| (s * 100.0).round() / 100.0)
             );
-            if fit.min_support() < 0.35 {
-                eprintln!(
-                    "warning: an edge is poorly supported; check calib.png before trusting this"
+            let problem = calib::check_plausible(&fit.corners, (fw, fh), &start)
+                .err()
+                .or_else(|| {
+                    (fit.min_support() < 0.35).then(|| "an edge is poorly supported".to_string())
+                });
+            if let Some(why) = problem {
+                std::fs::create_dir_all(dir)?;
+                draw_quad(&mut frame, &start, [255, 160, 0]);
+                draw_quad(&mut frame, &fit.corners, [255, 0, 0]);
+                write_png(&dir.join("calib.png"), &frame)?;
+                anyhow::bail!(
+                    "not saving: {why}. See {}/calib.png (red: rejected fit, orange: start). Make sure the whole \
+                     board is in view, or start nearer with --from, or set corners by hand with --set.",
+                    dir.display()
                 );
             }
             fit.corners
@@ -471,14 +493,20 @@ fn seg_bench(
 }
 
 /// Segmentation-frame -> board-canvas warp for the ghost's matte, and segmentation pixels per board pixel.
+/// Segmentation runs on the upright picture, so the corners are turned too.
 fn mask_map_for(
     corners: &calib::Corners,
-    (cam_w, cam_h): (usize, usize),
+    cam: (usize, usize),
+    rot: u32,
     (sw, sh): (usize, usize),
     ((cw, ch), (bw, bh)): ((usize, usize), (usize, usize)),
 ) -> Result<(ResampleMap, f32)> {
-    let (kx, ky) = (sw as f64 / cam_w as f64, sh as f64 / cam_h as f64);
-    let c = corners.map(|[x, y]| [x * kx, y * ky]);
+    let (uw, uh) = image::upright_size(cam, rot);
+    let (kx, ky) = (sw as f64 / uw as f64, sh as f64 / uh as f64);
+    let c = corners.map(|p| {
+        let [x, y] = image::to_upright(p, cam, rot);
+        [x * kx, y * ky]
+    });
     let map = ResampleMap::board(&c, sw, sh, cw, ch, bw, bh, [0; 3])?;
     // Along the board's longer (nearer) vertical edge.
     let scale = (dist(c[0], c[3]).max(dist(c[1], c[2])) / bh as f64) as f32;
@@ -500,19 +528,23 @@ fn run(
     } else {
         light::Light::from_config(&args.light)?.map(light::LightGuard::new)
     };
+    // Sizes are given landscape; a camera on its side gives portrait upright pictures.
+    let seg_res = image::upright_size(args.seg_res, cfg.rotate);
     let mut ghost = if args.no_ghost {
         None
     } else {
-        let (sw, sh) = args.seg_res;
+        let (sw, sh) = seg_res;
         let seg = ghost::Segmenter::start(
             &args.model,
             (cam.w, cam.h),
+            cfg.rotate,
             (sw, sh),
             args.seg_ratio,
             args.seg_threads,
             args.seg_fps,
         )?;
-        let (mask_map, seg_scale) = mask_map_for(&cfg.corners, (cam.w, cam.h), (sw, sh), dims)?;
+        let (mask_map, seg_scale) =
+            mask_map_for(&cfg.corners, (cam.w, cam.h), cfg.rotate, (sw, sh), dims)?;
         let params = ghost::GhostParams {
             opacity: args.ghost_opacity,
             ..Default::default()
@@ -531,10 +563,10 @@ fn run(
     let mut raw_out = if args.no_raw {
         None
     } else {
-        let (w, h) = args.raw_size;
+        let (w, h) = image::upright_size(args.raw_size, cfg.rotate);
         Some((
             Sink::open(&args.raw, w, h, args.io)?,
-            ResampleMap::scale(cam.w, cam.h, w, h),
+            ResampleMap::upright(cam.w, cam.h, w, h, cfg.rotate),
             Rgb::new(w, h),
             camera::watch_openers(&args.raw),
         ))
@@ -598,7 +630,7 @@ fn run(
             );
             board_map = ResampleMap::board(&c, cam.w, cam.h, cw, ch, bw, bh, BG)?;
             if let Some((_, g, _)) = &mut ghost {
-                let (map, scale) = mask_map_for(&c, (cam.w, cam.h), args.seg_res, dims)?;
+                let (map, scale) = mask_map_for(&c, (cam.w, cam.h), cfg.rotate, seg_res, dims)?;
                 g.recalibrate(map, scale);
             }
             if let Err(e) = save_corners(config_path, &c) {
