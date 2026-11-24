@@ -8,7 +8,8 @@
 //!   once a pixel is still (temporal denoise of faint chalk); large ones (new chalk, erasing) only after the
 //!   pixel has been still for ~1/3 s, then quickly, so they arrive in about half a second. The stillness
 //!   requirement is what keeps a fast-moving hand that the laggy matte missed out of the memory.
-//! - Output: memory, with the live frame blended in at `opacity` where the matte says person.
+//! - Output: the memory (optionally chalk-enhanced by the caller), then `overlay` blends the live frame in at
+//!   `opacity` where the matte says person.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -237,13 +238,42 @@ impl Ghost {
         }
     }
 
-    /// Composite one frame, taking the newest matte from the segmentation worker if there is one.
-    pub fn step(&mut self, live: &Rgb, seg: &mut Segmenter, out: &mut Rgb) {
+    /// Update the board memory with this frame (taking the newest matte from the segmentation worker if there
+    /// is one) and write the memory, without me, to `board`. Draw me over it afterwards with `overlay`.
+    pub fn step(&mut self, live: &Rgb, seg: &mut Segmenter, board: &mut Rgb) {
         let fresh = seg.latest(&mut self.seg_alpha);
-        self.composite(live, fresh, out);
+        self.composite(live, fresh, board);
     }
 
-    /// Composite one frame. `live` is the warped board; `fresh` says `seg_alpha` holds a new matte.
+    pub fn opacity(&self) -> f32 {
+        self.p.opacity
+    }
+
+    pub fn set_opacity(&mut self, opacity: f32) {
+        self.p.opacity = opacity;
+    }
+
+    /// Draw me (the live frame where the matte says person) over `board` at the ghost opacity.
+    pub fn overlay(&self, board: &Rgb, live: &Rgb, out: &mut Rgb) {
+        let (w, opacity) = (self.w, self.p.opacity);
+        out.data
+            .par_chunks_mut(w * 3)
+            .zip(board.data.par_chunks(w * 3))
+            .zip(live.data.par_chunks(w * 3))
+            .zip(self.alpha.par_chunks(w))
+            .with_min_len(ROWS_PER_TASK)
+            .for_each(|(((out, board), live), alpha)| {
+                for x in 0..w {
+                    let a = opacity * alpha[x];
+                    for c in x * 3..x * 3 + 3 {
+                        let (b, l) = (board[c] as f32, live[c] as f32);
+                        out[c] = (b + a * (l - b)).round() as u8;
+                    }
+                }
+            });
+    }
+
+    /// Update the memory with one frame and write it to `out`. `fresh` says `seg_alpha` holds a new matte.
     fn composite(&mut self, live: &Rgb, fresh: bool, out: &mut Rgb) {
         assert_eq!((live.w, live.h), (self.w, self.h));
         if fresh {
@@ -273,53 +303,49 @@ impl Ghost {
             .zip(live.data.par_chunks(w * 3))
             .zip(self.hold.par_chunks_mut(w))
             .zip(self.grown.par_chunks(w))
-            .zip(self.alpha.par_chunks(w))
             .zip(self.prev.par_chunks_mut(w * 3))
             .zip(self.still.par_chunks_mut(w))
             .with_min_len(ROWS_PER_TASK)
-            .for_each(
-                |(((((((mem, out), live), hold), grown), alpha), prev), still)| {
-                    for x in 0..w {
-                        let i = x * 3;
-                        let (r, g, b) = (live[i] as f32, live[i + 1] as f32, live[i + 2] as f32);
-                        let moved = (0..3)
-                            .map(|c| (live[i + c] as i16 - prev[i + c] as i16).unsigned_abs())
-                            .max()
-                            .unwrap() as f32;
-                        prev[i..i + 3].copy_from_slice(&live[i..i + 3]);
-                        still[x] = if moved > p.motion {
-                            0
-                        } else {
-                            still[x].saturating_add(1)
-                        };
-                        hold[x] = grown[x].max(hold[x] * p.hold_decay);
-                        if hold[x] < 0.05 {
-                            let d = (r - mem[i])
-                                .abs()
-                                .max((g - mem[i + 1]).abs())
-                                .max((b - mem[i + 2]).abs());
-                            let k = if d > p.ink_diff {
-                                if still[x] >= p.settle {
-                                    p.rate_fast
-                                } else {
-                                    0.0
-                                }
-                            } else if still[x] >= p.settle_slow {
-                                p.rate_slow
+            .for_each(|((((((mem, out), live), hold), grown), prev), still)| {
+                for x in 0..w {
+                    let i = x * 3;
+                    let (r, g, b) = (live[i] as f32, live[i + 1] as f32, live[i + 2] as f32);
+                    let moved = (0..3)
+                        .map(|c| (live[i + c] as i16 - prev[i + c] as i16).unsigned_abs())
+                        .max()
+                        .unwrap() as f32;
+                    prev[i..i + 3].copy_from_slice(&live[i..i + 3]);
+                    still[x] = if moved > p.motion {
+                        0
+                    } else {
+                        still[x].saturating_add(1)
+                    };
+                    hold[x] = grown[x].max(hold[x] * p.hold_decay);
+                    if hold[x] < 0.05 {
+                        let d = (r - mem[i])
+                            .abs()
+                            .max((g - mem[i + 1]).abs())
+                            .max((b - mem[i + 2]).abs());
+                        let k = if d > p.ink_diff {
+                            if still[x] >= p.settle {
+                                p.rate_fast
                             } else {
                                 0.0
-                            };
-                            mem[i] += k * (r - mem[i]);
-                            mem[i + 1] += k * (g - mem[i + 1]);
-                            mem[i + 2] += k * (b - mem[i + 2]);
-                        }
-                        let a = p.opacity * alpha[x];
-                        out[i] = (mem[i] + a * (r - mem[i])).round() as u8;
-                        out[i + 1] = (mem[i + 1] + a * (g - mem[i + 1])).round() as u8;
-                        out[i + 2] = (mem[i + 2] + a * (b - mem[i + 2])).round() as u8;
+                            }
+                        } else if still[x] >= p.settle_slow {
+                            p.rate_slow
+                        } else {
+                            0.0
+                        };
+                        mem[i] += k * (r - mem[i]);
+                        mem[i + 1] += k * (g - mem[i + 1]);
+                        mem[i + 2] += k * (b - mem[i + 2]);
                     }
-                },
-            );
+                    out[i] = mem[i].round() as u8;
+                    out[i + 1] = mem[i + 1].round() as u8;
+                    out[i + 2] = mem[i + 2].round() as u8;
+                }
+            });
     }
 }
 

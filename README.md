@@ -66,7 +66,26 @@ cargo run --release -- --no-raw  # board only
 cargo run --release -- snap out/ # one frame -> out/raw.png (board quad outlined) + out/board.png
 cargo run --release -- --no-ghost             # plain deskewed board, no segmentation
 cargo run --release -- --ghost-opacity 0.4    # make me more visible
+cargo run --release -- --look paper           # dark ink on white (also: natural, the default; plain)
 ```
+
+`snap` averages 16 frames and writes every look: `raw.png`, `board.png`, `board_natural.png`, `board_paper.png`.
+
+**Keys while streaming:** `l` cycles the look (plain → natural → paper), `g` hides/shows the ghost. Ctrl-C stops.
+
+### Looks
+
+| Look | What |
+|---|---|
+| `natural` (default) | lighting flattened to an even board colour at a fixed brightness, chalk boosted, colours kept |
+| `paper` | dark ink on white, chalk only (sticky notes and chalk-dust haze become paper); clearest in poor light |
+| `plain` | the board as the camera sees it |
+
+Chalk is found with a white top-hat (the image minus its morphological opening, which keeps only bright strokes
+thinner than ~11 px), so big bright areas like sticky notes and haze aren't treated as ink. Lighting is a coarse
+median estimate, refreshed twice a second, and divides out (gain capped at 3× so unlit corners don't turn to
+noise). In ghost mode enhancement runs at ~10 Hz on the slowly changing board memory, and I'm drawn on top
+every frame.
 
 ### How ghost mode works
 

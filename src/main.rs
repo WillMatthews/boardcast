@@ -1,9 +1,11 @@
 //! boardvu: a webcam pointed at my blackboard -> two v4l2loopback cameras (raw passthrough + deskewed board).
 
 mod camera;
+mod enhance;
 mod geom;
 mod ghost;
 mod image;
+mod keys;
 mod light;
 mod segment;
 
@@ -93,6 +95,9 @@ struct RunArgs {
     /// How frames are written to the virtual cameras.
     #[arg(long, value_enum, default_value_t = SinkIo::Mmap)]
     io: SinkIo,
+    /// How the board looks (switch while running with the `l` key).
+    #[arg(long, value_enum, default_value_t = enhance::Look::Natural)]
+    look: enhance::Look,
     /// Plain deskewed board: no segmentation, no board memory, no ghost.
     #[arg(long)]
     no_ghost: bool,
@@ -253,13 +258,36 @@ fn snap(cam: &mut Camera, board_map: &ResampleMap, cfg: &Config, dir: &Path) -> 
     for _ in 0..30 {
         cam.next_into(&mut frame)?;
     }
+    // Average 16 frames: a still is then about as clean as ghost mode's denoised board memory.
     let mut board = Rgb::new(board_map.out_w, board_map.out_h);
-    board_map.apply(&frame, &mut board);
+    let mut sum = vec![0u32; board.data.len()];
+    const N: u32 = 16;
+    for _ in 0..N {
+        cam.next_into(&mut frame)?;
+        board_map.apply(&frame, &mut board);
+        for (s, &v) in sum.iter_mut().zip(&board.data) {
+            *s += v as u32;
+        }
+    }
+    for (b, s) in board.data.iter_mut().zip(&sum) {
+        *b = ((s + N / 2) / N) as u8;
+    }
     std::fs::create_dir_all(dir)?;
     write_png(&dir.join("board.png"), &board)?;
+    let mut enhanced = Rgb::new(board.w, board.h);
+    for (look, name) in [
+        (enhance::Look::Natural, "natural"),
+        (enhance::Look::Paper, "paper"),
+    ] {
+        enhance::Enhancer::new(look, board.w, board.h).apply(&board, &mut enhanced);
+        write_png(&dir.join(format!("board_{name}.png")), &enhanced)?;
+    }
     draw_quad(&mut frame, &cfg.corners, [255, 0, 0]);
     write_png(&dir.join("raw.png"), &frame)?;
-    eprintln!("wrote {0}/raw.png and {0}/board.png", dir.display());
+    eprintln!(
+        "wrote raw.png, board.png, board_natural.png, board_paper.png to {}",
+        dir.display()
+    );
     Ok(())
 }
 
@@ -377,6 +405,14 @@ fn run(
 
     let mut frame = Rgb::new(cam.w, cam.h);
     let mut board = Rgb::new(board_map.out_w, board_map.out_h);
+    let mut enhancer = enhance::Enhancer::new(args.look, board.w, board.h);
+    let mut enhanced = Rgb::new(board.w, board.h);
+    let mut last_enhance = Instant::now() - Duration::from_secs(1);
+    let keys = keys::Keys::start();
+    eprintln!(
+        "look: {:?} | keys: l = cycle look (plain/natural/paper), g = toggle ghost",
+        args.look
+    );
     let mut board_yuyv = vec![0u8; board.w * board.h * 2];
     let mut raw_yuyv = raw_out
         .as_ref()
@@ -406,13 +442,47 @@ fn run(
         if args.test_flash {
             board.data.fill(if n % 2 == 0 { 0 } else { 255 });
         }
+        while let Ok(k) = keys.rx.try_recv() {
+            match k {
+                b'l' => {
+                    enhancer.look = enhancer.look.next();
+                    last_enhance = Instant::now() - Duration::from_secs(1);
+                    eprintln!("look: {:?}", enhancer.look);
+                }
+                b'g' => {
+                    if let Some((_, g, _)) = &mut ghost {
+                        let o = if g.opacity() > 0.0 {
+                            0.0
+                        } else {
+                            args.ghost_opacity.max(0.05)
+                        };
+                        g.set_opacity(o);
+                        eprintln!("ghost opacity: {o}");
+                    }
+                }
+                _ => {}
+            }
+        }
+        // Board memory (or the live board) -> chalk enhancement -> me drawn over it.
         let shown = match &mut ghost {
             Some((seg, g, out)) => {
                 seg.submit(&frame);
                 g.step(&board, seg, out);
+                // The memory changes slowly (half-second fades), so ~10 Hz enhancement looks the same and
+                // costs a third as much at 30 fps; I'm drawn over it every frame.
+                if enhancer.look == enhance::Look::Plain
+                    || last_enhance.elapsed() >= Duration::from_millis(90)
+                {
+                    enhancer.apply(out, &mut enhanced);
+                    last_enhance = Instant::now();
+                }
+                g.overlay(&enhanced, &board, out);
                 &*out
             }
-            None => &board,
+            None => {
+                enhancer.apply(&board, &mut enhanced);
+                &enhanced
+            }
         };
         rgb_to_yuyv(shown, &mut board_yuyv);
         board_sink.write(&board_yuyv)?;
