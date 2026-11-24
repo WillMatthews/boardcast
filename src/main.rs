@@ -1,14 +1,16 @@
-//! boardvu: a webcam pointed at my blackboard -> two v4l2loopback cameras (raw passthrough + deskewed board).
+//! boardvu: a webcam pointed at a blackboard -> two v4l2loopback cameras (raw passthrough + deskewed board).
 
 mod calib;
 mod camera;
 mod enhance;
 mod geom;
 mod ghost;
+mod grid;
 mod image;
 mod keys;
 mod light;
 mod log;
+mod paths;
 mod pip;
 mod pose;
 mod secrets;
@@ -30,7 +32,7 @@ use camera::{Camera, Focus, Sink, SinkIo};
 use image::{ResampleMap, Rgb, rgb_to_yuyv};
 
 #[derive(Parser)]
-#[command(about = "Blackboard virtual camera", version)]
+#[command(about = "Blackboard virtual camera: a deskewed, cleaned-up board with you as a see-through ghost", version)]
 struct Cli {
     #[command(subcommand)]
     cmd: Option<Cmd>,
@@ -44,6 +46,22 @@ struct Cli {
 enum Cmd {
     /// Stream to the virtual cameras (the default).
     Run,
+    /// First-time setup: write a starting config, and a picture of what the camera sees with a pixel grid over it
+    /// (setup.png), to read the board's corners from for `calibrate --from`.
+    Setup {
+        /// Where setup.png goes.
+        #[arg(default_value = ".")]
+        dir: PathBuf,
+        /// Camera resolution to use (default: the largest the camera offers as MJPEG).
+        #[arg(long, value_parser = parse_size)]
+        frame: Option<(usize, usize)>,
+        /// Degrees to turn the camera's picture clockwise to make it upright, for a camera mounted on its side.
+        #[arg(long, default_value_t = 0, value_parser = parse_rotate)]
+        rotate: u32,
+        /// Replace an existing config (it is left alone otherwise).
+        #[arg(long)]
+        force: bool,
+    },
     /// Grab one frame and write raw.png (full frame, board quad outlined) and board.png to a directory.
     Snap {
         #[arg(default_value = ".")]
@@ -94,7 +112,7 @@ enum Cmd {
 #[derive(Args)]
 struct Common {
     /// Light control config (Home Assistant). Missing file = no light control.
-    #[arg(long, global = true, default_value = concat!(env!("CARGO_MANIFEST_DIR"), "/light.json"))]
+    #[arg(long, global = true, default_value_os_t = paths::config("light.json"))]
     light: PathBuf,
     /// Leave the board light alone.
     #[arg(long, global = true)]
@@ -103,7 +121,7 @@ struct Common {
     #[arg(long, default_value = "/dev/video0")]
     cam: String,
     /// Calibration file (board corners, focus, aspect).
-    #[arg(long, default_value = concat!(env!("CARGO_MANIFEST_DIR"), "/board.json"))]
+    #[arg(long, global = true, default_value_os_t = paths::config("board.json"))]
     config: PathBuf,
     /// Focus override: "auto" or a focus_absolute value (default: the config's).
     #[arg(long)]
@@ -143,11 +161,11 @@ struct RunArgs {
     /// Plain deskewed board: no segmentation, no board memory, no ghost.
     #[arg(long)]
     no_ghost: bool,
-    /// How visible I am over the board in ghost mode (0 = invisible, 1 = fully live).
+    /// How visible you are over the board in ghost mode (0 = invisible, 1 = fully live).
     #[arg(long, default_value_t = 0.25)]
     ghost_opacity: f32,
     /// Segmentation model (Robust Video Matting, MobileNetV3 ONNX).
-    #[arg(long, default_value = concat!(env!("CARGO_MANIFEST_DIR"), "/models/rvm_mobilenetv3_fp32.onnx"))]
+    #[arg(long, default_value_os_t = paths::model("rvm_mobilenetv3_fp32.onnx"))]
     model: PathBuf,
     /// Resolution the camera frame is downscaled to for segmentation.
     #[arg(long, default_value = "512x288", value_parser = parse_size)]
@@ -158,17 +176,17 @@ struct RunArgs {
     /// CPU threads for segmentation.
     #[arg(long, default_value_t = 2)]
     seg_threads: usize,
-    /// Maximum segmentation rate. Higher follows me more closely and costs more CPU.
+    /// Maximum segmentation rate. Higher follows you more closely and costs more CPU.
     #[arg(long, default_value_t = 10.0)]
     seg_fps: f32,
     /// Threads for the per-frame image work (warp, ghost, colour conversion).
     #[arg(long, default_value_t = 4)]
     threads: usize,
-    /// Start with the picture-in-picture of me showing (toggle with `p`; needs ghost mode's segmentation).
+    /// Start with the picture-in-picture of you showing (toggle with `p`; needs ghost mode's segmentation).
     #[arg(long)]
     pip: bool,
-    /// Pose model for finding my head in the picture-in-picture (YOLO pose, ONNX).
-    #[arg(long, default_value = concat!(env!("CARGO_MANIFEST_DIR"), "/models/yolo11n-pose.onnx"))]
+    /// Pose model for finding your head in the picture-in-picture (YOLO pose, ONNX).
+    #[arg(long, default_value_os_t = paths::model("yolo11n-pose.onnx"))]
     pose_model: PathBuf,
     /// Picture-in-picture size, as a fraction of the feed's width.
     #[arg(long, default_value_t = 0.3)]
@@ -181,18 +199,46 @@ struct RunArgs {
     no_tui: bool,
 }
 
-#[derive(Deserialize)]
+/// The config file as written: no corners until the first `calibrate`.
+#[derive(Deserialize, serde::Serialize)]
+struct ConfigFile {
+    /// TL, TR, BR, BL in full-resolution camera pixels, on the edges of the writing surface.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    corners: Option<[[f64; 2]; 4]>,
+    /// Camera frame size the corners refer to.
+    frame: [usize; 2],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    focus: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    aspect: Option<f64>,
+    #[serde(default)]
+    rotate: u32,
+}
+
+impl ConfigFile {
+    fn complete(self, path: &Path) -> Result<Config> {
+        Ok(Config {
+            corners: self.corners.with_context(|| {
+                format!(
+                    "{} has no board corners yet: run `boardvu setup`, then `boardvu calibrate --from \"x,y x,y x,y x,y\"`",
+                    path.display()
+                )
+            })?,
+            focus: self.focus,
+            aspect: self.aspect,
+            rotate: self.rotate,
+        })
+    }
+}
+
 struct Config {
     /// TL, TR, BR, BL in full-resolution camera pixels, on the edges of the writing surface.
     corners: [[f64; 2]; 4],
-    /// Camera frame size the corners refer to.
-    frame: [usize; 2],
     focus: Option<i64>,
     /// Real board width / height. Estimated from the corners if absent (perspective makes that a guess).
     aspect: Option<f64>,
     /// Degrees to turn the camera picture clockwise to make it upright (camera mounted on its side): 0, 90, 180,
     /// 270. Corners are always listed in the board's own order (its top-left first), whatever the rotation.
-    #[serde(default)]
     rotate: u32,
 }
 
@@ -208,6 +254,13 @@ fn parse_size(s: &str) -> Result<(usize, usize), String> {
         return Err("width and height must be even (4:2:x chroma pairs pixels and rows)".into());
     }
     Ok((w, h))
+}
+
+fn parse_rotate(s: &str) -> Result<u32, String> {
+    match s.parse() {
+        Ok(r @ (0 | 90 | 180 | 270)) => Ok(r),
+        _ => Err("must be 0, 90, 180 or 270".into()),
+    }
 }
 
 fn parse_corners(s: &str) -> Result<calib::Corners, String> {
@@ -237,7 +290,7 @@ fn save_corners(path: &Path, corners: &calib::Corners) -> Result<()> {
     Ok(())
 }
 
-/// Steps of `,` / `.` in focus_absolute units (the C200 spans 300..650).
+/// Steps of `,` / `.` in focus_absolute units (an Anker C200 spans 300..650).
 const FOCUS_STEP: i64 = 5;
 
 fn describe_focus(f: Focus) -> String {
@@ -257,10 +310,16 @@ fn save_focus(path: &Path, focus: i64) -> Result<()> {
     Ok(())
 }
 
-fn load_config(path: &Path) -> Result<Config> {
+fn load_config(path: &Path) -> Result<ConfigFile> {
+    if !path.exists() {
+        anyhow::bail!(
+            "no config at {}: run `boardvu setup` first (or pass --config)",
+            path.display()
+        );
+    }
     let text =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    let cfg: Config =
+    let cfg: ConfigFile =
         serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
     anyhow::ensure!(
         [0, 90, 180, 270].contains(&cfg.rotate),
@@ -300,11 +359,11 @@ fn fit_dims(cfg: &Config, (cw, ch): (usize, usize)) -> (usize, usize) {
     (w & !1, h & !1)
 }
 
-fn focus_of(common: &Common, cfg: &Config) -> Result<Focus> {
+fn focus_of(common: &Common, saved: Option<i64>) -> Result<Focus> {
     Ok(match common.focus.as_deref() {
         Some("auto") => Focus::Auto,
         Some(v) => Focus::Fixed(v.parse().context("--focus must be 'auto' or an integer")?),
-        None => cfg.focus.map_or(Focus::Auto, Focus::Fixed),
+        None => saved.map_or(Focus::Auto, Focus::Fixed),
     })
 }
 
@@ -314,13 +373,17 @@ fn main() -> Result<()> {
         .num_threads(cli.run.threads)
         .thread_name(|i| format!("img{i}"))
         .build_global()?;
-    let cfg = load_config(&cli.common.config)?;
-    let [fw, fh] = cfg.frame;
-    let ((cw, ch), (bw, bh)) = match cli.common.size {
-        Some(canvas) => (canvas, fit_dims(&cfg, canvas)),
-        None => (native_dims(&cfg), native_dims(&cfg)),
-    };
-    let board_map = ResampleMap::board(&cfg.corners, fw, fh, cw, ch, bw, bh, BG)?;
+    if let Some(Cmd::Setup {
+        dir,
+        frame,
+        rotate,
+        force,
+    }) = &cli.cmd
+    {
+        return setup(&cli.common, dir, *frame, *rotate, *force);
+    }
+    let file = load_config(&cli.common.config)?;
+    let [fw, fh] = file.frame;
     if let Some(Cmd::SegBench {
         dir,
         res,
@@ -342,7 +405,7 @@ fn main() -> Result<()> {
                 })
             }
             None => {
-                let mut cam = Camera::open(&cli.common.cam, fw, fh, focus_of(&cli.common, &cfg)?)?;
+                let mut cam = Camera::open(&cli.common.cam, fw, fh, focus_of(&cli.common, file.focus)?)?;
                 Box::new(move |out: &mut Rgb| cam.next_into(out))
             }
         };
@@ -363,9 +426,15 @@ fn main() -> Result<()> {
         dry_run,
     }) = &cli.cmd
     {
-        return calibrate_cmd(&cli.common, &cfg, dir, *search, *from, *set, *dry_run);
+        return calibrate_cmd(&cli.common, &file, dir, *search, *from, *set, *dry_run);
     }
-    let mut cam = Camera::open(&cli.common.cam, fw, fh, focus_of(&cli.common, &cfg)?)?;
+    let cfg = file.complete(&cli.common.config)?;
+    let ((cw, ch), (bw, bh)) = match cli.common.size {
+        Some(canvas) => (canvas, fit_dims(&cfg, canvas)),
+        None => (native_dims(&cfg), native_dims(&cfg)),
+    };
+    let board_map = ResampleMap::board(&cfg.corners, fw, fh, cw, ch, bw, bh, BG)?;
+    let mut cam = Camera::open(&cli.common.cam, fw, fh, focus_of(&cli.common, cfg.focus)?)?;
     eprintln!(
         "camera {} {fw}x{fh}; board {bw}x{bh} in a {cw}x{ch} canvas",
         cli.common.cam
@@ -380,7 +449,9 @@ fn main() -> Result<()> {
             &cli.common.config,
             dry_run,
         ),
-        Cmd::SegBench { .. } | Cmd::Calibrate { .. } => unreachable!("handled above"),
+        Cmd::Setup { .. } | Cmd::SegBench { .. } | Cmd::Calibrate { .. } => {
+            unreachable!("handled above")
+        }
         Cmd::Run => run(
             &mut cam,
             board_map,
@@ -489,6 +560,59 @@ fn focus_sweep(
     Ok(())
 }
 
+fn setup(
+    common: &Common,
+    dir: &Path,
+    frame: Option<(usize, usize)>,
+    rotate: u32,
+    force: bool,
+) -> Result<()> {
+    let (fw, fh) = match frame {
+        Some(f) => f,
+        None => camera::largest_mjpeg(&common.cam)?,
+    };
+    let mut cam = Camera::open(&common.cam, fw, fh, Focus::Auto)?;
+    eprintln!("camera {} {fw}x{fh}", common.cam);
+    let mut img = Rgb::new(fw, fh);
+    for _ in 0..45 {
+        cam.next_into(&mut img)?; // let exposure and autofocus settle
+    }
+    grid::draw(&mut img, 100);
+    std::fs::create_dir_all(dir)?;
+    let png = dir.join("setup.png");
+    write_png(&png, &img)?;
+    let path = &common.config;
+    if path.exists() && !force {
+        eprintln!(
+            "{} already exists; left alone (--force to start over)",
+            path.display()
+        );
+    } else {
+        let file = ConfigFile {
+            corners: None,
+            frame: [fw, fh],
+            focus: None,
+            aspect: None,
+            rotate,
+        };
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, serde_json::to_string_pretty(&file)? + "\n")?;
+        eprintln!("wrote {}", path.display());
+    }
+    eprintln!(
+        "wrote {}: the camera's view with a grid every 100 px.
+
+Next: read the board's four corners off it (roughly is fine, within ~50 px), starting with the board's own top-left
+and going clockwise (top-right, bottom-right, bottom-left), and run
+    boardvu calibrate --from \"x,y x,y x,y x,y\"
+then `boardvu focus` (stand aside) and `boardvu snap out/` to check the result.",
+        png.display()
+    );
+    Ok(())
+}
+
 fn snap(cam: &mut Camera, board_map: &ResampleMap, cfg: &Config, dir: &Path) -> Result<()> {
     let mut frame = Rgb::new(cam.w, cam.h);
     // Let auto-exposure and the locked focus settle.
@@ -530,7 +654,7 @@ fn snap(cam: &mut Camera, board_map: &ResampleMap, cfg: &Config, dir: &Path) -> 
 
 fn calibrate_cmd(
     common: &Common,
-    cfg: &Config,
+    cfg: &ConfigFile,
     dir: &Path,
     search: i32,
     from: Option<calib::Corners>,
@@ -538,7 +662,7 @@ fn calibrate_cmd(
     dry_run: bool,
 ) -> Result<()> {
     let [fw, fh] = cfg.frame;
-    let mut cam = Camera::open(&common.cam, fw, fh, focus_of(common, cfg)?)?;
+    let mut cam = Camera::open(&common.cam, fw, fh, focus_of(common, cfg.focus)?)?;
     let mut frame = Rgb::new(fw, fh);
     for _ in 0..30 {
         cam.next_into(&mut frame)?; // let exposure settle
@@ -560,7 +684,10 @@ fn calibrate_cmd(
             c
         }
         None => {
-            let start = from.unwrap_or(cfg.corners);
+            let start = from.or(cfg.corners).context(
+                "no corners to start from yet: give rough ones with --from \"x,y x,y x,y x,y\" (read them off \
+                 setup.png from `boardvu setup`)",
+            )?;
             let fit = calib::calibrate(&frame, &start, search)
                 .context("couldn't find all four board edges near the starting corners (try --search or --from)")?;
             eprintln!(
@@ -597,7 +724,9 @@ fn calibrate_cmd(
         .collect();
     eprintln!("corners (TL TR BR BL): {}", fmt.join(" "));
     std::fs::create_dir_all(dir)?;
-    draw_quad(&mut frame, &cfg.corners, [255, 160, 0]);
+    if let Some(prev) = &cfg.corners {
+        draw_quad(&mut frame, prev, [255, 160, 0]);
+    }
     draw_quad(&mut frame, &corners, [0, 255, 0]);
     write_png(&dir.join("calib.png"), &frame)?;
     eprintln!(
@@ -621,7 +750,7 @@ fn seg_bench(
     ratio: f32,
     threads: usize,
 ) -> Result<()> {
-    let model = Path::new(env!("CARGO_MANIFEST_DIR")).join("models/rvm_mobilenetv3_fp32.onnx");
+    let model = paths::model("rvm_mobilenetv3_fp32.onnx");
     let mut m = segment::Matting::new(&model, w, h, ratio, threads)?;
     let down = ResampleMap::scale(fw, fh, w, h);
     let (mut frame, mut small) = (Rgb::new(fw, fh), Rgb::new(w, h));
@@ -859,7 +988,7 @@ fn run(
                     say!("picture-in-picture {}", if pip.on { "on" } else { "off" });
                 }
                 b'p' => say!(
-                    "picture-in-picture needs ghost mode (it follows me with the segmentation)"
+                    "picture-in-picture needs ghost mode (it follows you with the segmentation)"
                 ),
                 b'b' | b'-' | b'=' | b'+' | b'k' if light.is_none() => {
                     say!(

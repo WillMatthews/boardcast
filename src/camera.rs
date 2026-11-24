@@ -38,6 +38,20 @@ pub struct Camera {
     focus_range: Option<(i64, i64)>,
 }
 
+/// The largest frame size `path` offers as MJPEG.
+pub fn largest_mjpeg(path: &str) -> Result<(usize, usize)> {
+    let dev = Device::with_path(path).with_context(|| format!("opening {path}"))?;
+    let sizes = Capture::enum_framesizes(&dev, FourCC::new(b"MJPG"))
+        .with_context(|| format!("listing {path}'s frame sizes"))?;
+    sizes
+        .into_iter()
+        .flat_map(|s| s.size.to_discrete())
+        .map(|d| (d.width as usize, d.height as usize))
+        .filter(|&(w, h)| w % 2 == 0 && h % 2 == 0)
+        .max_by_key(|&(w, h)| w * h)
+        .with_context(|| format!("{path} offers no MJPEG frame sizes (boardvu needs an MJPEG webcam)"))
+}
+
 impl Camera {
     pub fn open(path: &str, w: usize, h: usize, focus: Focus) -> Result<Self> {
         let dev = Device::with_path(path).with_context(|| format!("opening {path}"))?;

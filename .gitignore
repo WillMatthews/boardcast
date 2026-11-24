@@ -1,4 +1,8 @@
 /target
-/models/*.onnx
-/light.json
+/models/
 /out/
+# Your own setup lives in ~/.config/boardvu; these are old copies or calibrate/setup output.
+/board.json
+/light.json
+/calib.png
+/setup.png
