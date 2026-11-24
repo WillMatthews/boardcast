@@ -229,6 +229,26 @@ fn save_corners(path: &Path, corners: &calib::Corners) -> Result<()> {
     Ok(())
 }
 
+/// Steps of `,` / `.` in focus_absolute units (the C200 spans 300..650).
+const FOCUS_STEP: i64 = 5;
+
+fn describe_focus(f: Focus) -> String {
+    match f {
+        Focus::Auto => "auto".into(),
+        Focus::Fixed(v) => format!("{v}"),
+    }
+}
+
+fn save_focus(path: &Path, focus: i64) -> Result<()> {
+    let text = std::fs::read_to_string(path)?;
+    let mut v: serde_json::Value = serde_json::from_str(&text)?;
+    v["focus"] = focus.into();
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_string_pretty(&v)? + "\n")?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
 fn load_config(path: &Path) -> Result<Config> {
     let text =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
@@ -544,11 +564,14 @@ fn run(
 ) -> Result<()> {
     let ((cw, ch), (bw, bh)) = dims;
     // Light first, so the camera's auto-exposure settles on the lit board. Dropped (light off) on any exit.
-    let _light = if args.no_light {
+    let mut light = if args.no_light {
         None
     } else {
-        light::Light::from_config(&args.light)?.map(light::LightGuard::new)
+        light::Light::start(&args.light)?
     };
+    // The board's focus: `f` switches between it and autofocus; `,` / `.` adjust it (saved to the config).
+    let mut board_focus = cfg.focus;
+    let mut focus_dirty: Option<Instant> = None;
     // Sizes are given landscape; a camera on its side gives portrait upright pictures.
     let seg_res = image::upright_size(args.seg_res, cfg.rotate);
     let mut ghost = if args.no_ghost {
@@ -686,6 +709,17 @@ fn run(
             (None, Some(k)) => k.rx.try_iter().collect(),
             (None, None) => Vec::new(),
         };
+        // A hand-set focus is saved once it has stopped changing, for the next run.
+        if focus_dirty.is_some_and(|t| t.elapsed() > Duration::from_secs(2)) {
+            focus_dirty = None;
+            if let Focus::Fixed(v) = cam.focus() {
+                board_focus = Some(v);
+                match save_focus(config_path, v) {
+                    Ok(()) => say!("saved board focus {v} to {}", config_path.display()),
+                    Err(e) => say!("warning: couldn't save the focus: {e:#}"),
+                }
+            }
+        }
         for k in pressed {
             match k {
                 b'q' => stop.store(true, Ordering::SeqCst),
@@ -701,6 +735,68 @@ fn run(
                 b'p' => say!(
                     "picture-in-picture needs ghost mode (it follows me with the segmentation)"
                 ),
+                b'b' | b'-' | b'=' | b'+' | b'k' if light.is_none() => {
+                    say!(
+                        "no board light ({} missing, or --no-light)",
+                        args.light.display()
+                    )
+                }
+                b'b' => {
+                    let l = light.as_mut().unwrap();
+                    let s = l.state();
+                    l.set(light::State { on: !s.on, ..s });
+                    say!("board light {}", l.state().describe());
+                }
+                b'-' | b'=' | b'+' => {
+                    let l = light.as_mut().unwrap();
+                    l.set(l.state().brighter(if k == b'-' { -1 } else { 1 }));
+                    say!("board light {}", l.state().describe());
+                }
+                b'k' => {
+                    let l = light.as_mut().unwrap();
+                    l.set(l.state().next_kelvin());
+                    say!("board light {}", l.state().describe());
+                }
+                b'f' => match cam.focus() {
+                    Focus::Fixed(_) => {
+                        cam.set_focus(Focus::Auto);
+                        say!("focus: auto");
+                    }
+                    Focus::Auto => {
+                        // The saved board focus; with none saved, lock wherever autofocus has got to.
+                        match board_focus.or_else(|| cam.focus_position()) {
+                            Some(v) => {
+                                let f = cam.set_focus(Focus::Fixed(v));
+                                say!("focus: board ({})", describe_focus(f));
+                                if board_focus.is_none() {
+                                    focus_dirty = Some(Instant::now());
+                                }
+                            }
+                            None => say!(
+                                "no board focus saved and the camera won't say where autofocus is"
+                            ),
+                        }
+                    }
+                },
+                b',' | b'.' | b'<' | b'>' => {
+                    let step = if matches!(k, b',' | b'<') {
+                        -FOCUS_STEP
+                    } else {
+                        FOCUS_STEP
+                    };
+                    let from = match cam.focus() {
+                        Focus::Fixed(v) => Some(v),
+                        Focus::Auto => cam.focus_position().or(board_focus),
+                    };
+                    match from {
+                        Some(v) => {
+                            let f = cam.set_focus(Focus::Fixed(v + step));
+                            say!("focus: board ({})", describe_focus(f));
+                            focus_dirty = Some(Instant::now());
+                        }
+                        None => say!("can't adjust focus: the camera won't say where it is"),
+                    }
+                }
                 b'o' => {
                     pip.corner = pip.corner.next();
                     say!("picture-in-picture: {:?}", pip.corner);
@@ -776,6 +872,12 @@ fn run(
                 look: enhancer.look,
                 ghost: ghost.as_ref().map(|(_, g, _)| g.opacity()),
                 pip: ghost.as_ref().map(|_| pip.describe()),
+                light: light.as_ref().map(|l| l.describe()),
+                focus: match cam.focus() {
+                    Focus::Auto => "auto".into(),
+                    Focus::Fixed(v) if Some(v) == board_focus => format!("board ({v})"),
+                    Focus::Fixed(v) => format!("board ({v}, saving…)"),
+                },
                 tracker: tracker.as_ref(),
                 perf,
                 started,

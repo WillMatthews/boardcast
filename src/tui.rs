@@ -39,6 +39,9 @@ pub struct Status<'a> {
     pub ghost: Option<f32>,
     /// Picture-in-picture state; None without ghost mode.
     pub pip: Option<String>,
+    /// Board light state; None without light control.
+    pub light: Option<String>,
+    pub focus: String,
     pub tracker: Option<&'a Tracker>,
     pub perf: Perf,
     pub started: Instant,
@@ -136,7 +139,7 @@ fn ago(t: Instant) -> String {
 fn render(f: &mut ratatui::Frame, s: &Status) {
     let [title, top, mid, log, keys] = Layout::vertical([
         Constraint::Length(1),
-        Constraint::Length(6),
+        Constraint::Length(7),
         Constraint::Length(6),
         Constraint::Min(3),
         Constraint::Length(1),
@@ -237,6 +240,11 @@ fn render(f: &mut ratatui::Frame, s: &Status) {
         None => kv("pip", "needs ghost mode".dark_gray()),
         Some(d) => kv("pip", vec![dot(d != "off"), d.clone().into()]),
     });
+    lines.push(match &s.light {
+        None => kv("light", "not controlled".dark_gray()),
+        Some(d) => kv("light", vec![dot(!d.starts_with("off")), d.clone().into()]),
+    });
+    lines.push(kv("focus", s.focus.clone()));
     f.render_widget(Paragraph::new(lines).block(block("view")), view);
 
     let p = s.perf;
@@ -291,6 +299,11 @@ fn render(f: &mut ratatui::Frame, s: &Status) {
         ("g", "ghost"),
         ("p", "picture-in-picture"),
         ("o", "move it"),
+        ("b", "light"),
+        ("-=", "brightness"),
+        ("k", "colour"),
+        ("f", "focus"),
+        (",.", "adjust"),
         ("q", "quit"),
     ] {
         spans.extend(key(k, w));

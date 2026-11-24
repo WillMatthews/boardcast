@@ -59,7 +59,9 @@ picture-in-picture follows the top of the person matte.
 boardvu can turn the board light on while it runs and off when it stops, through Home Assistant. Copy
 `light.example.json` to `light.json` (gitignored) and fill in the URL, the light's entity id, and the `light.turn_on`
 service data to use while running. The token is read from `HA_API_KEY` in the environment, or from a `HA_API_KEY=...`
-line in `~/.tokens`. Without `light.json`, or with `--no-light`, the light is left alone.
+line in `~/.tokens`. Without `light.json`, or with `--no-light`, the light is left alone. While running, `b` switches
+it on and off, `-` / `=` dim and brighten it in tenths, and `k` steps the colour temperature (2700–6500 K); the
+changes go to Home Assistant in the background and last until boardvu stops.
 
 ## Use
 
@@ -82,7 +84,12 @@ them), the look and ghost, board tracking, frame rate and CPU, and a log. `--no-
 prints plain log lines instead.
 
 **Keys while streaming:** `l` cycles the look (plain → natural → paper), `g` steps me through hidden → ghost 0.1 → ghost 0.25 → ghost 0.5 → opaque (fully
-shown, no ghosting). `p` toggles a picture-in-picture of me, `o` moves it to the next corner. `q`, Esc or Ctrl-C stops.
+shown, no ghosting). `p` toggles a picture-in-picture of me, `o` moves it to the next corner. `b`, `-`/`=` and `k` control the board light (see above). `q`, Esc or Ctrl-C stops.
+
+**Focus.** Autofocus locks onto whoever is in front of the board, so boardvu normally holds the lens at the board's
+focus from `board.json`. `f` switches between that and autofocus. `,` / `.` move the board focus nearer / further by
+hand, and the value is saved to `board.json` a couple of seconds after it stops changing. With no focus saved yet,
+let autofocus find the board (stand aside) and press `f` to lock it there.
 
 **Picture-in-picture.** A squircle crop of me, inset in a corner of the board feed (same resolution, so meeting
 apps don't notice it coming and going). It follows my head (found by the pose model, or the person matte; either way it needs ghost

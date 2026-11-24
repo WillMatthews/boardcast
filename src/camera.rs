@@ -19,6 +19,7 @@ use crate::image::Rgb;
 const CID_FOCUS_ABSOLUTE: u32 = 0x009a_090a;
 const CID_FOCUS_AUTO_CONTINUOUS: u32 = 0x009a_090c;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Focus {
     Auto,
     Fixed(i64),
@@ -31,6 +32,10 @@ pub struct Camera {
     pub w: usize,
     pub h: usize,
     pub path: String,
+    dev: &'static Device,
+    focus: Focus,
+    /// focus_absolute's range, if the camera reports one.
+    focus_range: Option<(i64, i64)>,
 }
 
 impl Camera {
@@ -49,14 +54,12 @@ impl Camera {
                 fmt.height
             );
         }
-        match focus {
-            Focus::Auto => set(&dev, CID_FOCUS_AUTO_CONTINUOUS, 1),
-            Focus::Fixed(v) => {
-                // Autofocus locks onto whoever is in the foreground, not the board, so pin it.
-                set(&dev, CID_FOCUS_AUTO_CONTINUOUS, 0);
-                set(&dev, CID_FOCUS_ABSOLUTE, v);
-            }
-        }
+        let focus_range = dev.query_controls().ok().and_then(|cs| {
+            cs.iter()
+                .find(|c| c.id == CID_FOCUS_ABSOLUTE)
+                .map(|c| (c.minimum, c.maximum))
+        });
+        apply_focus(&dev, focus);
         // The stream keeps the device handle alive; leak the Device so the stream can be 'static.
         let dev: &'static Device = Box::leak(Box::new(dev));
         let stream =
@@ -67,7 +70,35 @@ impl Camera {
             w,
             h,
             path: path.to_string(),
+            dev,
+            focus,
+            focus_range,
         })
+    }
+
+    pub fn focus(&self) -> Focus {
+        self.focus
+    }
+
+    /// Where the lens is now (under autofocus, wherever it has driven to).
+    pub fn focus_position(&self) -> Option<i64> {
+        match self.dev.control(CID_FOCUS_ABSOLUTE).ok()?.value {
+            Value::Integer(v) => Some(v),
+            _ => None,
+        }
+    }
+
+    /// Change focus while streaming; a fixed value is clamped to the camera's range. Returns what was set.
+    pub fn set_focus(&mut self, focus: Focus) -> Focus {
+        let focus = match (focus, self.focus_range) {
+            (Focus::Fixed(v), Some((lo, hi))) => Focus::Fixed(v.clamp(lo, hi)),
+            (f, _) => f,
+        };
+        if focus != self.focus {
+            apply_focus(self.dev, focus);
+            self.focus = focus;
+        }
+        focus
     }
 
     /// Block for the next frame and decode it into `out`.
@@ -97,6 +128,17 @@ pub fn decode_jpeg(bytes: &[u8]) -> Result<Rgb> {
     let data = dec.decode().context("decoding JPEG")?;
     let (w, h) = dec.dimensions().context("no dimensions")?;
     Ok(Rgb { w, h, data })
+}
+
+fn apply_focus(dev: &Device, focus: Focus) {
+    match focus {
+        Focus::Auto => set(dev, CID_FOCUS_AUTO_CONTINUOUS, 1),
+        Focus::Fixed(v) => {
+            // Autofocus locks onto whoever is in the foreground, not the board, so pin it.
+            set(dev, CID_FOCUS_AUTO_CONTINUOUS, 0);
+            set(dev, CID_FOCUS_ABSOLUTE, v);
+        }
+    }
 }
 
 fn set(dev: &Device, id: u32, v: i64) {
