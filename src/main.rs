@@ -109,8 +109,14 @@ struct RunArgs {
     #[arg(long, default_value_t = 0.75)]
     seg_ratio: f32,
     /// CPU threads for segmentation.
-    #[arg(long, default_value_t = 4)]
+    #[arg(long, default_value_t = 2)]
     seg_threads: usize,
+    /// Maximum segmentation rate. Higher follows me more closely and costs more CPU.
+    #[arg(long, default_value_t = 10.0)]
+    seg_fps: f32,
+    /// Threads for the per-frame image work (warp, ghost, colour conversion).
+    #[arg(long, default_value_t = 4)]
+    threads: usize,
     /// Light control config (Home Assistant). Missing file = no light control.
     #[arg(long, default_value = concat!(env!("CARGO_MANIFEST_DIR"), "/light.json"))]
     light: PathBuf,
@@ -190,6 +196,10 @@ fn focus_of(common: &Common, cfg: &Config) -> Result<Focus> {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(cli.run.threads)
+        .thread_name(|i| format!("img{i}"))
+        .build_global()?;
     let cfg = load_config(&cli.common.config)?;
     let [fw, fh] = cfg.frame;
     let ((cw, ch), (bw, bh)) = match cli.common.size {
@@ -319,10 +329,14 @@ fn run(
             (sw, sh),
             args.seg_ratio,
             args.seg_threads,
+            args.seg_fps,
         )?;
         let (kx, ky) = (sw as f64 / cam.w as f64, sh as f64 / cam.h as f64);
         let corners = cfg.corners.map(|[x, y]| [x * kx, y * ky]);
         let mask_map = ResampleMap::board(&corners, sw, sh, cw, ch, bw, bh, [0; 3])?;
+        // Segmentation pixels per board pixel, along the board's longer (nearer) vertical edge.
+        let seg_scale =
+            (dist(corners[0], corners[3]).max(dist(corners[1], corners[2])) / bh as f64) as f32;
         let params = ghost::GhostParams {
             opacity: args.ghost_opacity,
             ..Default::default()
@@ -333,7 +347,7 @@ fn run(
         );
         Some((
             seg,
-            ghost::Ghost::new(params, cw, ch, mask_map, sw, sh),
+            ghost::Ghost::new(params, cw, ch, mask_map, sw, sh, seg_scale),
             Rgb::new(cw, ch),
         ))
     };
@@ -346,6 +360,7 @@ fn run(
             Sink::open(&args.raw, w, h, args.io)?,
             ResampleMap::scale(cam.w, cam.h, w, h),
             Rgb::new(w, h),
+            camera::watch_openers(&args.raw),
         ))
     };
     if let Some((s, ..)) = &raw_out {
@@ -365,7 +380,7 @@ fn run(
     let mut board_yuyv = vec![0u8; board.w * board.h * 2];
     let mut raw_yuyv = raw_out
         .as_ref()
-        .map(|(_, _, r)| vec![0u8; r.w * r.h * 2])
+        .map(|(_, _, r, _)| vec![0u8; r.w * r.h * 2])
         .unwrap_or_default();
 
     let (mut n, mut t_wait, mut t_dec, mut t_work) =
@@ -401,7 +416,10 @@ fn run(
         };
         rgb_to_yuyv(shown, &mut board_yuyv);
         board_sink.write(&board_yuyv)?;
-        if let Some((sink, map, img)) = &mut raw_out {
+        // The raw feed is ~0.7 of a core at 1080p: only produce it while something is reading it.
+        if let Some((sink, map, img, watched)) = &mut raw_out
+            && watched.load(Ordering::Relaxed)
+        {
             map.apply(&frame, img);
             rgb_to_yuyv(img, &mut raw_yuyv);
             sink.write(&raw_yuyv)?;

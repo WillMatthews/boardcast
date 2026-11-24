@@ -311,3 +311,48 @@ impl Sink {
         .with_context(|| format!("writing to {}", self.path))
     }
 }
+
+/// Whether any other process has `path` open (e.g. a browser or ffplay reading a loopback device).
+/// Scans /proc/<pid>/fd; only processes we can see (our own user's) are found, which covers meeting apps.
+pub fn has_other_opener(path: &std::path::Path) -> bool {
+    let me = std::process::id().to_string();
+    let Ok(procs) = std::fs::read_dir("/proc") else {
+        return true;
+    };
+    for p in procs.flatten() {
+        let name = p.file_name();
+        let Some(pid) = name.to_str() else { continue };
+        if pid == me || !pid.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        let Ok(fds) = std::fs::read_dir(p.path().join("fd")) else {
+            continue;
+        };
+        if fds
+            .flatten()
+            .any(|fd| std::fs::read_link(fd.path()).is_ok_and(|t| t == path))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Polls `has_other_opener` once a second in the background.
+pub fn watch_openers(path: &str) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let flag = std::sync::Arc::new(AtomicBool::new(true));
+    let (f, path) = (flag.clone(), std::path::PathBuf::from(path));
+    std::thread::Builder::new()
+        .name("openers".into())
+        .spawn(move || {
+            loop {
+                // Sleep first: the flag starts true so the first frames get written, which is what makes an
+                // exclusive_caps loopback device advertise itself as a camera at all.
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                f.store(has_other_opener(&path), Ordering::Relaxed);
+            }
+        })
+        .expect("spawning opener watcher");
+    flag
+}

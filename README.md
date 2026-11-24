@@ -70,20 +70,23 @@ cargo run --release -- --ghost-opacity 0.4    # make me more visible
 
 ### How ghost mode works
 
-- A worker thread runs Robust Video Matting on a 512×288 copy of each frame (CPU, about 55 ms) and publishes the
-  newest matte; the video loop never waits for it.
+- A worker thread runs Robust Video Matting on a 512×288 copy of the newest frame, at most 10 times a second
+  (CPU, about 55 ms each), and publishes the newest matte; the video loop never waits for it.
 - The matte is warped into board space, grown by 2.5% of the board height, and held for a few frames after I
   move, so the board memory never learns me.
-- The board memory is a per-pixel running average, updated only where I'm not and nothing is moving. Small
-  differences update slowly, which denoises faint chalk; big stable ones (new chalk, erasing) arrive in about
-  half a second.
+- The board memory is a per-pixel running average, updated only where I'm not. Small differences update slowly,
+  which denoises faint chalk. Big ones (new chalk, erasing) are only accepted once the pixel has been still for
+  ~1/3 s, so a moving hand the matte missed is never absorbed, and then arrive in about half a second.
 - Output: the memory, with the live frame blended in at `--ghost-opacity` where the matte says person.
+
+The raw feed is only produced while another process has `/dev/video10` open (checked once a second), so it costs
+nothing when unused. Typical CPU at 15 fps: about 2.2 cores (2.65 with the raw feed watched).
 
 In the meeting, pick **boardvu board** (or **boardvu raw** for the normal camera view).
 
 Other options: `--size WxH` (pad the board into a fixed canvas, e.g. 1920x1080; default is the board alone at its native
 resolution), `--raw-size WxH`, `--focus auto|N`, `--cam`, `--raw`, `--board`, `--config`, `--seg-res`,
-`--seg-ratio`, `--seg-threads`, `--model`, `--light`.
+`--seg-ratio`, `--seg-threads`, `--seg-fps`, `--threads`, `--model`, `--light`.
 
 ## Calibration (`board.json`)
 

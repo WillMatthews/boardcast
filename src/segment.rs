@@ -35,6 +35,11 @@ impl Matting {
             .map_err(ort_err)?
             .with_intra_threads(threads)
             .map_err(ort_err)?
+            // Idle ORT threads busy-wait by default, burning whole cores between our ~10 Hz runs.
+            .with_intra_op_spinning(false)
+            .map_err(ort_err)?
+            .with_inter_op_spinning(false)
+            .map_err(ort_err)?
             .commit_from_file(model)
             .map_err(ort_err)
             .with_context(|| format!("loading {} (run scripts/fetch-model.sh)", model.display()))?;

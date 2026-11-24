@@ -4,6 +4,9 @@ use rayon::prelude::*;
 
 use crate::geom::Homography;
 
+/// Minimum image rows per parallel task: one-row tasks cost more in scheduling than in work.
+pub const ROWS_PER_TASK: usize = 16;
+
 /// Packed 8-bit RGB image.
 pub struct Rgb {
     pub w: usize,
@@ -131,6 +134,7 @@ impl ResampleMap {
         let stride = self.src_w;
         dst.par_chunks_mut(self.out_w)
             .zip(self.taps.par_chunks(self.out_w))
+            .with_min_len(ROWS_PER_TASK)
             .for_each(|(out, taps)| {
                 for (o, t) in out.iter_mut().zip(taps) {
                     if t.idx == u32::MAX {
@@ -158,6 +162,7 @@ impl ResampleMap {
         dst.data
             .par_chunks_mut(self.out_w * 3)
             .zip(self.taps.par_chunks(self.out_w))
+            .with_min_len(ROWS_PER_TASK)
             .for_each(|(out, taps)| {
                 for (px, t) in out.chunks_exact_mut(3).zip(taps) {
                     if t.idx == u32::MAX {
@@ -186,6 +191,7 @@ pub fn rgb_to_yuyv(src: &Rgb, dst: &mut [u8]) {
     assert_eq!(dst.len(), src.w * src.h * 2);
     dst.par_chunks_mut(src.w * 2)
         .zip(src.data.par_chunks(src.w * 3))
+        .with_min_len(ROWS_PER_TASK)
         .for_each(|(out, row)| {
             for (o, p) in out.chunks_exact_mut(4).zip(row.chunks_exact(6)) {
                 let y = |r: i32, g: i32, b: i32| ((66 * r + 129 * g + 25 * b + 128) >> 8) + 16;
