@@ -79,8 +79,8 @@ pub struct LightGuard(Light);
 impl LightGuard {
     pub fn new(light: Light) -> Self {
         match light.on() {
-            Ok(()) => eprintln!("board light on"),
-            Err(e) => eprintln!("warning: {e:#}"),
+            Ok(()) => crate::say!("board light on"),
+            Err(e) => crate::say!("warning: {e:#}"),
         }
         LightGuard(light)
     }
@@ -89,8 +89,8 @@ impl LightGuard {
 impl Drop for LightGuard {
     fn drop(&mut self) {
         match self.0.off() {
-            Ok(()) => eprintln!("board light off"),
-            Err(e) => eprintln!("warning: {e:#}"),
+            Ok(()) => crate::say!("board light off"),
+            Err(e) => crate::say!("warning: {e:#}"),
         }
     }
 }

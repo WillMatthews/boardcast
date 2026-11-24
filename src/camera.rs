@@ -30,6 +30,7 @@ pub struct Camera {
     pub last_decode: std::time::Duration,
     pub w: usize,
     pub h: usize,
+    pub path: String,
 }
 
 impl Camera {
@@ -65,6 +66,7 @@ impl Camera {
             last_decode: Default::default(),
             w,
             h,
+            path: path.to_string(),
         })
     }
 
@@ -102,7 +104,7 @@ fn set(dev: &Device, id: u32, v: i64) {
         id,
         value: Value::Integer(v),
     }) {
-        eprintln!("warning: couldn't set camera control {id:#x}={v}: {e}");
+        crate::say!("warning: couldn't set camera control {id:#x}={v}: {e}");
     }
 }
 

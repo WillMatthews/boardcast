@@ -9,8 +9,10 @@ mod image;
 mod keys;
 mod latex;
 mod light;
+mod log;
 mod secrets;
 mod segment;
+mod tui;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -152,6 +154,9 @@ struct RunArgs {
     /// Leave the board light alone.
     #[arg(long)]
     no_light: bool,
+    /// Plain log lines instead of the full-screen status display.
+    #[arg(long)]
+    no_tui: bool,
     /// Turn off the LaTeX view (`t`), which sends the board to OpenAI.
     #[arg(long)]
     no_latex: bool,
@@ -522,11 +527,11 @@ fn request_latex(
     // A fresh enhancer measures the lighting on its first frame.
     enhance::Enhancer::new(enhance::Look::Paper, board.w, board.h).apply(board, &mut paper);
     if t.request(&paper, canvas, dims, BG, force) {
-        eprintln!("LaTeX: transcribing with {}...", t.p.model);
+        say!("LaTeX: transcribing with {}...", t.p.model);
     } else if t.busy() {
-        eprintln!("LaTeX: already transcribing");
+        say!("LaTeX: already transcribing");
     } else {
-        eprintln!("LaTeX: board unchanged, showing the last page (r to redo)");
+        say!("LaTeX: board unchanged, showing the last page (r to redo)");
     }
 }
 
@@ -587,7 +592,7 @@ fn run(
             opacity: args.ghost_opacity,
             ..Default::default()
         };
-        eprintln!(
+        say!(
             "ghost mode: segmenting at {sw}x{sh}, opacity {}",
             args.ghost_opacity
         );
@@ -610,11 +615,13 @@ fn run(
         ))
     };
     if let Some((s, ..)) = &raw_out {
-        eprintln!("raw   -> {} ({}x{})", s.path, s.w, s.h);
+        say!("raw   -> {} ({}x{})", s.path, s.w, s.h);
     }
-    eprintln!(
+    say!(
         "board -> {} ({}x{})",
-        board_sink.path, board_sink.w, board_sink.h
+        board_sink.path,
+        board_sink.w,
+        board_sink.h
     );
 
     let stop = Arc::new(AtomicBool::new(false));
@@ -641,7 +648,7 @@ fn run(
         match latex::Transcriber::start(p) {
             Ok(t) => Some(t),
             Err(e) => {
-                eprintln!("LaTeX view off: {e:#}");
+                say!("LaTeX view off: {e:#}");
                 None
             }
         }
@@ -649,12 +656,21 @@ fn run(
     let mut latex_view = false;
     // Set by `t`/`r`: transcribe the board once this frame's board memory is ready (true = even if unchanged).
     let mut want_latex: Option<bool> = None;
-    let keys = keys::Keys::start();
-    eprintln!(
-        "look: {:?} | keys: l = cycle look (plain/natural/paper), g = toggle ghost, t = LaTeX view, \
-         r = re-transcribe",
-        args.look
-    );
+    let board_watched = camera::watch_openers(&args.board);
+    let started = Instant::now();
+    // Full-screen status in a terminal; plain log lines otherwise (then keys come through `Keys`).
+    let mut tui = (!args.no_tui).then(tui::Tui::start).flatten();
+    let keys = tui.is_none().then(keys::Keys::start);
+    if tui.is_none() {
+        say!(
+            "look: {:?} | keys: l = cycle look (plain/natural/paper), g = toggle ghost, t = LaTeX view, \
+             r = re-transcribe",
+            args.look
+        );
+    }
+    let mut perf = tui::Perf::default();
+    let mut cpu_last = (cpu_seconds(), Instant::now());
+    let mut last_print = Instant::now();
     let mut board_yuyv = vec![0u8; board.w * board.h * 2];
     let mut raw_yuyv = raw_out
         .as_ref()
@@ -676,13 +692,13 @@ fn run(
                 if errors > 30 {
                     return Err(e.context("camera keeps failing"));
                 }
-                eprintln!("skipping frame: {e:#}");
+                say!("skipping frame: {e:#}");
                 continue;
             }
         }
         let t1 = Instant::now();
         if let Some(c) = tracker.as_mut().and_then(|t| t.check(&frame)) {
-            eprintln!(
+            say!(
                 "board moved in the frame: re-aligned (corners {})",
                 c.iter()
                     .map(|[x, y]| format!("{x:.1},{y:.1}"))
@@ -695,26 +711,32 @@ fn run(
                 g.recalibrate(map, scale);
             }
             if let Err(e) = save_corners(config_path, &c) {
-                eprintln!("warning: couldn't save the new corners: {e:#}");
+                say!("warning: couldn't save the new corners: {e:#}");
             }
         }
         board_map.apply(&frame, &mut board);
         if args.test_flash {
             board.data.fill(if n % 2 == 0 { 0 } else { 255 });
         }
-        while let Ok(k) = keys.rx.try_recv() {
+        let pressed: Vec<u8> = match (&mut tui, &keys) {
+            (Some(t), _) => t.keys(),
+            (None, Some(k)) => k.rx.try_iter().collect(),
+            (None, None) => Vec::new(),
+        };
+        for k in pressed {
             match k {
+                b'q' => stop.store(true, Ordering::SeqCst),
                 b'l' => {
                     enhancer.look = enhancer.look.next();
                     last_enhance = Instant::now() - Duration::from_secs(1);
-                    eprintln!("look: {:?}", enhancer.look);
+                    say!("look: {:?}", enhancer.look);
                 }
                 b't' if transcriber.is_some() => {
                     latex_view = !latex_view;
                     if latex_view {
                         want_latex = Some(false);
                     }
-                    eprintln!("LaTeX view {}", if latex_view { "on" } else { "off" });
+                    say!("LaTeX view {}", if latex_view { "on" } else { "off" });
                 }
                 b'r' if transcriber.is_some() => {
                     latex_view = true;
@@ -728,7 +750,7 @@ fn run(
                             args.ghost_opacity.max(0.05)
                         };
                         g.set_opacity(o);
-                        eprintln!("ghost opacity: {o}");
+                        say!("ghost opacity: {o}");
                     }
                 }
                 _ => {}
@@ -736,7 +758,7 @@ fn run(
         }
         if let Some(t) = &mut transcriber {
             if t.poll() {
-                eprintln!(
+                say!(
                     "LaTeX: typeset in {:.0} s, ${:.4} (session: {} calls, ${:.4}) -> {}",
                     t.last_secs,
                     t.last_cost,
@@ -748,7 +770,7 @@ fn run(
                         .unwrap_or_default()
                 );
             } else if let latex::State::Failed(e) = &t.state {
-                eprintln!("LaTeX failed after {:.0} s: {e}", t.last_secs);
+                say!("LaTeX failed after {:.0} s: {e}", t.last_secs);
                 t.state = latex::State::Idle;
                 latex_view = t.page.is_some() && latex_view;
             }
@@ -767,8 +789,10 @@ fn run(
                     .and_then(|t| t.page.as_ref());
                 // The memory changes slowly (half-second fades), so ~10 Hz enhancement looks the same and
                 // costs a third as much at 30 fps; I'm drawn over it every frame.
-                if enhancer.look == enhance::Look::Plain
-                    || last_enhance.elapsed() >= Duration::from_millis(90)
+                // (Not needed at all while the LaTeX page is shown.)
+                if page.is_none()
+                    && (enhancer.look == enhance::Look::Plain
+                        || last_enhance.elapsed() >= Duration::from_millis(90))
                 {
                     enhancer.apply(out, &mut enhanced);
                     last_enhance = Instant::now();
@@ -803,19 +827,54 @@ fn run(
             rgb_to_yuyv(img, &mut raw_yuyv);
             sink.write(&raw_yuyv)?;
         }
+        if let Some(t) = &mut tui {
+            fn feed<'a>(sink: &'a Sink, watched: &AtomicBool) -> tui::Feed<'a> {
+                tui::Feed {
+                    path: &sink.path,
+                    size: (sink.w, sink.h),
+                    watched: watched.load(Ordering::Relaxed),
+                }
+            }
+            t.draw(&tui::Status {
+                camera: (&cam.path, cam.w, cam.h),
+                board: feed(&board_sink, &board_watched),
+                raw: raw_out.as_ref().map(|(s, _, _, w)| feed(s, w)),
+                look: enhancer.look,
+                ghost: ghost.as_ref().map(|(_, g, _)| g.opacity()),
+                latex: transcriber.as_ref(),
+                latex_view,
+                tracker: tracker.as_ref(),
+                perf,
+                started,
+            });
+        }
         t_dec += cam.last_decode;
         t_wait += t1 - t0 - cam.last_decode;
         t_work += t1.elapsed();
         n += 1;
-        if last_report.elapsed() >= Duration::from_secs(10) {
+        if last_report.elapsed() >= Duration::from_secs(2) {
             let secs = last_report.elapsed().as_secs_f64();
-            eprintln!(
-                "{:.1} fps | per frame: waiting for camera {:.1} ms, decode {:.1} ms, warp+ghost+write {:.1} ms",
-                n as f64 / secs,
-                t_wait.as_secs_f64() * 1e3 / n as f64,
-                t_dec.as_secs_f64() * 1e3 / n as f64,
-                t_work.as_secs_f64() * 1e3 / n as f64
-            );
+            let cpu_now = (cpu_seconds(), Instant::now());
+            perf = tui::Perf {
+                fps: n as f64 / secs,
+                wait_ms: t_wait.as_secs_f64() * 1e3 / n as f64,
+                decode_ms: t_dec.as_secs_f64() * 1e3 / n as f64,
+                work_ms: t_work.as_secs_f64() * 1e3 / n as f64,
+                cpu: (cpu_now.0 - cpu_last.0) / (cpu_now.1 - cpu_last.1).as_secs_f64(),
+            };
+            cpu_last = cpu_now;
+            if tui.is_none() && last_print.elapsed() >= Duration::from_secs(10) {
+                last_print = Instant::now();
+                say!(
+                    "{:.1} fps, {:.1} cores | per frame: waiting for camera {:.1} ms, decode {:.1} ms, \
+                     warp+ghost+write {:.1} ms",
+                    perf.fps,
+                    perf.cpu,
+                    perf.wait_ms,
+                    perf.decode_ms,
+                    perf.work_ms
+                );
+            }
             (n, t_wait, t_dec, t_work, last_report) = (
                 0,
                 Duration::ZERO,
@@ -825,8 +884,20 @@ fn run(
             );
         }
     }
-    eprintln!("stopped");
+    drop(tui);
+    say!("stopped");
     Ok(())
+}
+
+/// CPU time this process has used (user + system), in seconds.
+fn cpu_seconds() -> f64 {
+    let stat = std::fs::read_to_string("/proc/self/stat").unwrap_or_default();
+    // Fields after the ")" that ends the command name; utime and stime are fields 14 and 15 overall.
+    let rest = stat.rsplit_once(')').map(|(_, r)| r).unwrap_or("");
+    let f: Vec<&str> = rest.split_whitespace().collect();
+    let ticks = |i: usize| f.get(i).and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
+    let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as f64;
+    (ticks(11) + ticks(12)) / hz.max(1.0)
 }
 
 fn draw_quad(img: &mut Rgb, c: &[[f64; 2]; 4], col: [u8; 3]) {

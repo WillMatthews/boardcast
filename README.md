@@ -71,8 +71,13 @@ cargo run --release -- --look paper           # dark ink on white (also: natural
 
 `snap` averages 16 frames and writes every look: `raw.png`, `board.png`, `board_natural.png`, `board_paper.png`.
 
+**Status display.** In a terminal, boardvu shows a full-screen status: the feeds (and whether anything is watching
+them), the look, ghost and LaTeX view, board tracking, the LaTeX view's cost (last transcription, session total,
+and an estimate per transcription), frame rate and CPU, and a log. `--no-tui` (or running without a terminal)
+prints plain log lines instead.
+
 **Keys while streaming:** `l` cycles the look (plain → natural → paper), `g` hides/shows the ghost, `t` toggles the
-LaTeX view, `r` re-transcribes. Ctrl-C stops.
+LaTeX view, `r` re-transcribes. `q`, Esc or Ctrl-C stops.
 
 ### LaTeX view (`t`)
 

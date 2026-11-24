@@ -192,7 +192,10 @@ pub struct Tracker {
     summed: usize,
     avg: Option<Rgb>,
     /// Consecutive checks without a well-supported fit (big move, or something in front of the board).
-    failures: usize,
+    pub failures: usize,
+    /// When the last check finished, and how far its fit was from the current corners (None: no fit).
+    pub checked: Option<std::time::Instant>,
+    pub shift: Option<f64>,
 }
 
 impl Tracker {
@@ -213,6 +216,8 @@ impl Tracker {
             summed: 0,
             avg: None,
             failures: 0,
+            checked: None,
+            shift: None,
         }
     }
 
@@ -245,14 +250,19 @@ impl Tracker {
             refine(frame, &self.corners, Self::SEARCH).and_then(|f| refine(frame, &f.corners, 6));
         if std::env::var_os("BOARDVU_DEBUG_TRACK").is_some() {
             match &fit {
-                Some(f) => eprintln!(
+                Some(f) => crate::say!(
                     "track: shift {:.1} px, support {:?}",
                     max_shift(&f.corners, &self.corners),
                     f.support.map(|s| (s * 100.0).round() / 100.0)
                 ),
-                None => eprintln!("track: no fit"),
+                None => crate::say!("track: no fit"),
             }
         }
+        self.checked = Some(std::time::Instant::now());
+        self.shift = fit
+            .as_ref()
+            .filter(|f| f.min_support() >= Self::SUPPORT)
+            .map(|f| max_shift(&f.corners, &self.corners));
         match fit {
             Some(fit) if fit.min_support() >= Self::SUPPORT => {
                 self.failures = 0;
@@ -262,7 +272,7 @@ impl Tracker {
                 self.recent.clear();
                 self.failures += 1;
                 if self.failures == 15 {
-                    eprintln!(
+                    crate::say!(
                         "can't find the board's edges near where they should be (30 s). If the camera moved \
                          a lot, stop and run `boardvu calibrate`."
                     );

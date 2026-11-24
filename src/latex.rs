@@ -68,6 +68,7 @@ pub struct Transcriber {
     made_from: Option<Vec<u8>>,
     pub calls: u32,
     pub usage: Usage,
+    pub last_usage: Usage,
     pub last_cost: f64,
     pub last_secs: f64,
     pub last_dir: Option<PathBuf>,
@@ -115,6 +116,7 @@ impl Transcriber {
             made_from: None,
             calls: 0,
             usage: Usage::default(),
+            last_usage: Usage::default(),
             last_cost: 0.0,
             last_secs: 0.0,
             last_dir: None,
@@ -175,6 +177,7 @@ impl Transcriber {
         self.calls += 1;
         self.usage.input += d.usage.input;
         self.usage.output += d.usage.output;
+        self.last_usage = d.usage;
         self.last_cost = d.usage.cost(&self.p);
         self.last_secs = since.elapsed().as_secs_f64();
         match d.result {

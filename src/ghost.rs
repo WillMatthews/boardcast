@@ -121,7 +121,7 @@ impl Segmenter {
                             m.0 += 1;
                             m.1.copy_from_slice(&alpha);
                         }
-                        Err(e) => eprintln!("segmentation failed: {e:#}"),
+                        Err(e) => crate::say!("segmentation failed: {e:#}"),
                     }
                     // Cap the rate; the compositor's stillness gate tolerates matte lag, so ~10 Hz is plenty.
                     // Sleeping here (not before the run) means the next run takes the freshest frame.
