@@ -124,6 +124,28 @@ impl ResampleMap {
         })
     }
 
+    /// Single-channel version of `apply` (e.g. a mask); outside the source reads as 0.
+    pub fn apply_gray(&self, src: &[f32], dst: &mut [f32]) {
+        assert_eq!(src.len(), self.src_w * self.src_h, "source size changed");
+        assert_eq!(dst.len(), self.out_w * self.out_h);
+        let stride = self.src_w;
+        dst.par_chunks_mut(self.out_w)
+            .zip(self.taps.par_chunks(self.out_w))
+            .for_each(|(out, taps)| {
+                for (o, t) in out.iter_mut().zip(taps) {
+                    if t.idx == u32::MAX {
+                        *o = 0.0;
+                        continue;
+                    }
+                    let i = t.idx as usize;
+                    let (fx, fy) = (t.fx as f32 / 256.0, t.fy as f32 / 256.0);
+                    let top = src[i] * (1.0 - fx) + src[i + 1] * fx;
+                    let bot = src[i + stride] * (1.0 - fx) + src[i + stride + 1] * fx;
+                    *o = top * (1.0 - fy) + bot * fy;
+                }
+            });
+    }
+
     pub fn apply(&self, src: &Rgb, dst: &mut Rgb) {
         assert_eq!(
             (src.w, src.h),

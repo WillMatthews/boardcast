@@ -89,6 +89,14 @@ impl Camera {
     }
 }
 
+/// Decode a JPEG file's bytes to RGB.
+pub fn decode_jpeg(bytes: &[u8]) -> Result<Rgb> {
+    let mut dec = JpegDecoder::new(Cursor::new(bytes));
+    let data = dec.decode().context("decoding JPEG")?;
+    let (w, h) = dec.dimensions().context("no dimensions")?;
+    Ok(Rgb { w, h, data })
+}
+
 fn set(dev: &Device, id: u32, v: i64) {
     if let Err(e) = dev.set_control(Control {
         id,

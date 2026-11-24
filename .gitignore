@@ -1,1 +1,4 @@
 /target
+/models/*.onnx
+/light.json
+/out/

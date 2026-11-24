@@ -2,7 +2,10 @@
 
 mod camera;
 mod geom;
+mod ghost;
 mod image;
+mod light;
+mod segment;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -35,6 +38,21 @@ enum Cmd {
     Snap {
         #[arg(default_value = ".")]
         dir: PathBuf,
+    },
+    /// Debug: time person segmentation on live frames and save the last matte.
+    #[command(hide = true)]
+    SegBench {
+        #[arg(default_value = ".")]
+        dir: PathBuf,
+        #[arg(long, default_value = "512x288", value_parser = parse_size)]
+        res: (usize, usize),
+        #[arg(long, default_value_t = 0.75)]
+        ratio: f32,
+        #[arg(long, default_value_t = 4)]
+        threads: usize,
+        /// Use a still JPEG instead of the camera.
+        #[arg(long)]
+        image: Option<PathBuf>,
     },
 }
 
@@ -75,6 +93,30 @@ struct RunArgs {
     /// How frames are written to the virtual cameras.
     #[arg(long, value_enum, default_value_t = SinkIo::Mmap)]
     io: SinkIo,
+    /// Plain deskewed board: no segmentation, no board memory, no ghost.
+    #[arg(long)]
+    no_ghost: bool,
+    /// How visible I am over the board in ghost mode (0 = invisible, 1 = fully live).
+    #[arg(long, default_value_t = 0.25)]
+    ghost_opacity: f32,
+    /// Segmentation model (Robust Video Matting, MobileNetV3 ONNX).
+    #[arg(long, default_value = concat!(env!("CARGO_MANIFEST_DIR"), "/models/rvm_mobilenetv3_fp32.onnx"))]
+    model: PathBuf,
+    /// Resolution the camera frame is downscaled to for segmentation.
+    #[arg(long, default_value = "512x288", value_parser = parse_size)]
+    seg_res: (usize, usize),
+    /// RVM's internal downsample ratio (aim for ratio * width of roughly 256-512).
+    #[arg(long, default_value_t = 0.75)]
+    seg_ratio: f32,
+    /// CPU threads for segmentation.
+    #[arg(long, default_value_t = 4)]
+    seg_threads: usize,
+    /// Light control config (Home Assistant). Missing file = no light control.
+    #[arg(long, default_value = concat!(env!("CARGO_MANIFEST_DIR"), "/light.json"))]
+    light: PathBuf,
+    /// Leave the board light alone.
+    #[arg(long)]
+    no_light: bool,
 }
 
 #[derive(Deserialize)]
@@ -155,6 +197,33 @@ fn main() -> Result<()> {
         None => (native_dims(&cfg), native_dims(&cfg)),
     };
     let board_map = ResampleMap::board(&cfg.corners, fw, fh, cw, ch, bw, bh, BG)?;
+    if let Some(Cmd::SegBench {
+        dir,
+        res,
+        ratio,
+        threads,
+        image,
+    }) = &cli.cmd
+    {
+        let mut source: Box<dyn FnMut(&mut Rgb) -> Result<()>> = match image {
+            Some(path) => {
+                let img = camera::decode_jpeg(&std::fs::read(path)?)?;
+                Box::new(move |out: &mut Rgb| {
+                    *out = Rgb {
+                        w: img.w,
+                        h: img.h,
+                        data: img.data.clone(),
+                    };
+                    Ok(())
+                })
+            }
+            None => {
+                let mut cam = Camera::open(&cli.common.cam, fw, fh, focus_of(&cli.common, &cfg)?)?;
+                Box::new(move |out: &mut Rgb| cam.next_into(out))
+            }
+        };
+        return seg_bench(&mut *source, (fw, fh), dir, *res, *ratio, *threads);
+    }
     let mut cam = Camera::open(&cli.common.cam, fw, fh, focus_of(&cli.common, &cfg)?)?;
     eprintln!(
         "camera {} {fw}x{fh}; board {bw}x{bh} in a {cw}x{ch} canvas",
@@ -163,7 +232,8 @@ fn main() -> Result<()> {
 
     match cli.cmd.unwrap_or(Cmd::Run) {
         Cmd::Snap { dir } => snap(&mut cam, &board_map, &cfg, &dir),
-        Cmd::Run => run(&mut cam, &board_map, &cli.run),
+        Cmd::SegBench { .. } => unreachable!("handled above"),
+        Cmd::Run => run(&mut cam, &board_map, &cfg, ((cw, ch), (bw, bh)), &cli.run),
     }
 }
 
@@ -183,7 +253,90 @@ fn snap(cam: &mut Camera, board_map: &ResampleMap, cfg: &Config, dir: &Path) -> 
     Ok(())
 }
 
-fn run(cam: &mut Camera, board_map: &ResampleMap, args: &RunArgs) -> Result<()> {
+fn seg_bench(
+    next: &mut dyn FnMut(&mut Rgb) -> Result<()>,
+    (fw, fh): (usize, usize),
+    dir: &Path,
+    (w, h): (usize, usize),
+    ratio: f32,
+    threads: usize,
+) -> Result<()> {
+    let model = Path::new(env!("CARGO_MANIFEST_DIR")).join("models/rvm_mobilenetv3_fp32.onnx");
+    let mut m = segment::Matting::new(&model, w, h, ratio, threads)?;
+    let down = ResampleMap::scale(fw, fh, w, h);
+    let (mut frame, mut small) = (Rgb::new(fw, fh), Rgb::new(w, h));
+    let mut alpha = vec![0f32; w * h];
+    let mut times = vec![];
+    for i in 0..60 {
+        next(&mut frame)?;
+        let t = Instant::now();
+        down.apply(&frame, &mut small);
+        m.run(&small, &mut alpha)?;
+        if i >= 10 {
+            times.push(t.elapsed().as_secs_f64() * 1e3);
+        }
+    }
+    times.sort_by(f64::total_cmp);
+    eprintln!(
+        "{w}x{h} ratio {ratio} threads {threads}: median {:.1} ms, p90 {:.1} ms",
+        times[times.len() / 2],
+        times[times.len() * 9 / 10]
+    );
+    std::fs::create_dir_all(dir)?;
+    let mut vis = Rgb::new(w, h);
+    for (i, a) in alpha.iter().enumerate() {
+        let px = &small.data[i * 3..i * 3 + 3];
+        // Person tinted red, background dimmed.
+        vis.data[i * 3] = (px[0] as f32 * (0.4 + 0.6 * a) + 120.0 * a).min(255.0) as u8;
+        vis.data[i * 3 + 1] = (px[1] as f32 * (0.4 + 0.2 * a)) as u8;
+        vis.data[i * 3 + 2] = (px[2] as f32 * (0.4 + 0.2 * a)) as u8;
+    }
+    write_png(&dir.join("matte.png"), &vis)?;
+    eprintln!("wrote {}/matte.png", dir.display());
+    Ok(())
+}
+
+fn run(
+    cam: &mut Camera,
+    board_map: &ResampleMap,
+    cfg: &Config,
+    ((cw, ch), (bw, bh)): ((usize, usize), (usize, usize)),
+    args: &RunArgs,
+) -> Result<()> {
+    // Light first, so the camera's auto-exposure settles on the lit board. Dropped (light off) on any exit.
+    let _light = if args.no_light {
+        None
+    } else {
+        light::Light::from_config(&args.light)?.map(light::LightGuard::new)
+    };
+    let mut ghost = if args.no_ghost {
+        None
+    } else {
+        let (sw, sh) = args.seg_res;
+        let seg = ghost::Segmenter::start(
+            &args.model,
+            (cam.w, cam.h),
+            (sw, sh),
+            args.seg_ratio,
+            args.seg_threads,
+        )?;
+        let (kx, ky) = (sw as f64 / cam.w as f64, sh as f64 / cam.h as f64);
+        let corners = cfg.corners.map(|[x, y]| [x * kx, y * ky]);
+        let mask_map = ResampleMap::board(&corners, sw, sh, cw, ch, bw, bh, [0; 3])?;
+        let params = ghost::GhostParams {
+            opacity: args.ghost_opacity,
+            ..Default::default()
+        };
+        eprintln!(
+            "ghost mode: segmenting at {sw}x{sh}, opacity {}",
+            args.ghost_opacity
+        );
+        Some((
+            seg,
+            ghost::Ghost::new(params, cw, ch, mask_map, sw, sh),
+            Rgb::new(cw, ch),
+        ))
+    };
     let mut board_sink = Sink::open(&args.board, board_map.out_w, board_map.out_h, args.io)?;
     let mut raw_out = if args.no_raw {
         None
@@ -238,7 +391,15 @@ fn run(cam: &mut Camera, board_map: &ResampleMap, args: &RunArgs) -> Result<()> 
         if args.test_flash {
             board.data.fill(if n % 2 == 0 { 0 } else { 255 });
         }
-        rgb_to_yuyv(&board, &mut board_yuyv);
+        let shown = match &mut ghost {
+            Some((seg, g, out)) => {
+                seg.submit(&frame);
+                g.step(&board, seg, out);
+                &*out
+            }
+            None => &board,
+        };
+        rgb_to_yuyv(shown, &mut board_yuyv);
         board_sink.write(&board_yuyv)?;
         if let Some((sink, map, img)) = &mut raw_out {
             map.apply(&frame, img);
@@ -252,7 +413,7 @@ fn run(cam: &mut Camera, board_map: &ResampleMap, args: &RunArgs) -> Result<()> 
         if last_report.elapsed() >= Duration::from_secs(10) {
             let secs = last_report.elapsed().as_secs_f64();
             eprintln!(
-                "{:.1} fps | per frame: waiting for camera {:.1} ms, decode {:.1} ms, warp+write {:.1} ms",
+                "{:.1} fps | per frame: waiting for camera {:.1} ms, decode {:.1} ms, warp+ghost+write {:.1} ms",
                 n as f64 / secs,
                 t_wait.as_secs_f64() * 1e3 / n as f64,
                 t_dec.as_secs_f64() * 1e3 / n as f64,

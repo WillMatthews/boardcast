@@ -7,7 +7,8 @@ A virtual camera of my blackboard. One process owns the real webcam and writes t
 | `/dev/video10` | `boardvu raw`   | the webcam, passed through (1920×1080)                      |
 | `/dev/video11` | `boardvu board` | the deskewed board at native resolution (about 710×948)     |
 
-See `PROJECT.md` for the plan. This is build step 1 (capture → deskew → virtual cameras).
+In **ghost mode** (the default) the board feed shows the board as it was last seen where I'm standing, with me
+drawn faintly over it, so the writing stays readable when I'm in the way. See `PROJECT.md` for the plan.
 
 ## Setup: the virtual camera devices (once per boot)
 
@@ -41,6 +42,19 @@ echo 'options v4l2loopback devices=2 video_nr=10,11 card_label="boardvu raw","bo
 something writes to an `exclusive_caps` device with plain `write()` calls (e.g. ffmpeg, or `boardvu --io write`) and
 then exits. Reload the module with `scripts/loopback.sh`.
 
+## Setup: the segmentation model (once)
+
+```sh
+scripts/fetch-model.sh   # models/rvm_mobilenetv3_fp32.onnx, Robust Video Matting (GPL-3.0)
+```
+
+## Setup: board light (optional)
+
+boardvu can turn the board light on while it runs and off when it stops, through Home Assistant. Copy
+`light.example.json` to `light.json` (gitignored) and fill in the URL, the light's entity id, and the `light.turn_on`
+service data to use while running. The token is read from `HA_API_KEY` in the environment, or from a `HA_API_KEY=...`
+line in `~/.tokens`. Without `light.json`, or with `--no-light`, the light is left alone.
+
 ## Use
 
 Run it only when you need it: while it runs it holds `/dev/video0`, so nothing else (e.g. `~/coding/ml/learn/board.py`)
@@ -50,12 +64,26 @@ can use the camera. Ctrl-C to stop.
 cargo run --release              # stream to /dev/video10 + /dev/video11
 cargo run --release -- --no-raw  # board only
 cargo run --release -- snap out/ # one frame -> out/raw.png (board quad outlined) + out/board.png
+cargo run --release -- --no-ghost             # plain deskewed board, no segmentation
+cargo run --release -- --ghost-opacity 0.4    # make me more visible
 ```
+
+### How ghost mode works
+
+- A worker thread runs Robust Video Matting on a 512×288 copy of each frame (CPU, about 55 ms) and publishes the
+  newest matte; the video loop never waits for it.
+- The matte is warped into board space, grown by 2.5% of the board height, and held for a few frames after I
+  move, so the board memory never learns me.
+- The board memory is a per-pixel running average, updated only where I'm not and nothing is moving. Small
+  differences update slowly, which denoises faint chalk; big stable ones (new chalk, erasing) arrive in about
+  half a second.
+- Output: the memory, with the live frame blended in at `--ghost-opacity` where the matte says person.
 
 In the meeting, pick **boardvu board** (or **boardvu raw** for the normal camera view).
 
-Options: `--size WxH` (pad the board into a fixed canvas, e.g. 1920x1080; default is the board alone at its native
-resolution), `--raw-size WxH`, `--focus auto|N`, `--cam`, `--raw`, `--board`, `--config`.
+Other options: `--size WxH` (pad the board into a fixed canvas, e.g. 1920x1080; default is the board alone at its native
+resolution), `--raw-size WxH`, `--focus auto|N`, `--cam`, `--raw`, `--board`, `--config`, `--seg-res`,
+`--seg-ratio`, `--seg-threads`, `--model`, `--light`.
 
 ## Calibration (`board.json`)
 

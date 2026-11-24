@@ -55,8 +55,8 @@ One process owns the real webcam and writes two v4l2loopback devices:
 
 ## Build order
 
-1. Capture -> deskew (manual corners) -> board virtual cam + raw passthrough.
-2. Segmentation + board memory + ghost.
+1. ~~Capture -> deskew (manual corners) -> board virtual cam + raw passthrough.~~ Done.
+2. Segmentation + board memory + ghost. (Board memory as a running average also gives the temporal denoise.)
 3. AprilTag calibration.
 4. Lighting correction / chalk enhancement + denoise.
 5. Triggered snapshots + OCR.

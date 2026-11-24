@@ -1,0 +1,5 @@
+{
+  "url": "https://homeassistant.local:8123",
+  "entity": "light.blackboard",
+  "on": { "brightness": 200, "color_temp_kelvin": 6500 }
+}
