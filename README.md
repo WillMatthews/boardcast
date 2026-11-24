@@ -9,25 +9,37 @@ A virtual camera of my blackboard. One process owns the real webcam and writes t
 
 See `PROJECT.md` for the plan. This is build step 1 (capture → deskew → virtual cameras).
 
-## Setup (once per boot)
+## Setup: the virtual camera devices (once per boot)
+
+boardvu writes into [v4l2loopback](https://github.com/v4l2loopback/v4l2loopback) devices, so the kernel module has
+to be loaded first. Ubuntu ships it with the kernel (0.12.7 at the time of writing); otherwise install
+`v4l2loopback-dkms`.
 
 ```sh
 sudo modprobe v4l2loopback devices=2 video_nr=10,11 \
     card_label="boardvu raw","boardvu board" exclusive_caps=1,1 max_buffers=8
 ```
 
-`exclusive_caps=1,1` (one value per device) makes them show up as cameras in browsers; Chrome/Meet need it.
-If a run fails with "setting YUYV ... Invalid argument", the driver is stuck: `sudo modprobe -r v4l2loopback`
-and load it again.
-`max_buffers=8` gives readers more slack: boardvu fills the buffers in rotation, so a slow reader never sees
-a frame being overwritten (the default of 2 gives one frame of slack).
-To load it at boot instead:
+or `scripts/loopback.sh`, which reloads the module if it's already loaded. What the options do:
+
+| Option | Why |
+|---|---|
+| `devices=2 video_nr=10,11` | two devices at fixed paths, `/dev/video10` (raw) and `/dev/video11` (board) |
+| `card_label=...` | the names meeting apps show in their camera picker |
+| `exclusive_caps=1,1` | **one value per device.** Devices advertise capture-only while boardvu is writing, which Chrome/Meet need to list them. They only appear in camera pickers while boardvu runs. |
+| `max_buffers=8` | boardvu fills buffers in rotation, so readers get up to 7 frames of slack before a frame they're copying is overwritten (tearing). The default 2 gives one frame. |
+
+To load it at every boot:
 
 ```sh
 echo v4l2loopback | sudo tee /etc/modules-load.d/boardvu.conf
 echo 'options v4l2loopback devices=2 video_nr=10,11 card_label="boardvu raw","boardvu board" exclusive_caps=1,1 max_buffers=8' \
     | sudo tee /etc/modprobe.d/boardvu.conf
 ```
+
+**If a run fails with `setting YUYV ... Invalid argument`**, the driver is stuck. On 0.12.7 that happens if
+something writes to an `exclusive_caps` device with plain `write()` calls (e.g. ffmpeg, or `boardvu --io write`) and
+then exits. Reload the module with `scripts/loopback.sh`.
 
 ## Use
 
