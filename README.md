@@ -45,8 +45,8 @@ flowchart LR
   stepped in front of it, and you're blended over it at a chosen opacity (or hidden altogether).
 - **Chalk enhancement**: uneven lighting is flattened and chalk strokes boosted. You can keep the board's colours or
   switch to dark ink on white paper.
-- **Picture-in-picture**: an optional rounded inset of your face, which follows your head, in a corner of the
-  board feed.
+- **Picture-in-picture**: an optional rounded inset of your face, which follows your head (found by a pose model),
+  in a corner of the board feed.
 - **Self-correcting**: if the camera gets bumped, boardcast finds the board's frame again and re-aligns by itself.
 - **Focus helpers**: holds the lens at the board's focus, so autofocus doesn't chase you, and can find the sharpest
   setting for you.
@@ -101,7 +101,8 @@ scripts/fetch-pose-model.sh  # optional: needed for the picture-in-picture (need
 #### Segmenting on an NVIDIA GPU
 
 Optional. On the CPU, segmentation takes ~45 ms a frame, so the ghost's matte updates 10 times a second. With CUDA it
-takes ~8 ms (RTX 2060), so it updates on every camera frame. You need an NVIDIA driver for CUDA 13 (r580 or later;
+takes ~8 ms (RTX 2060), so it updates on every camera frame, and you're cut out with that frame's own outline
+rather than one a frame or two old. You need an NVIDIA driver for CUDA 13 (r580 or later;
 see `nvidia-smi`). Then:
 
 ```sh
@@ -224,8 +225,9 @@ in-camera sharpening inflates it.
 A rounded crop of you, inset in a corner of the board feed. It doesn't change the feed's resolution, so meeting apps
 don't notice it coming and going. It follows your head and frames you the same whether you're at the board or close
 to the camera, and it fades out when you leave. It finds your head with a YOLO pose model, even when your back is
-turned or your arms are raised, so it needs that model (`scripts/fetch-pose-model.sh`) as well as ghost mode. Use `--pip-size` (a fraction of the feed's width, default 0.3) and `--pip-corner`
-to set it up.
+turned or your arms are raised, so it needs that model (`scripts/fetch-pose-model.sh`) as well as ghost mode. When
+you move it with `o`, it glides to the next corner. Use `--pip-size` (a fraction of the feed's width, default 0.3)
+and `--pip-corner` to set it up.
 
 ### Board light (optional)
 
@@ -284,7 +286,8 @@ moved further than tracking can follow, it prints a hint to run `calibrate`. `--
 
 - A worker thread runs [Robust Video Matting](https://github.com/PeterL1n/RobustVideoMatting) on a 512×288 copy of
   the newest frame, at most 10 times a second (about 55 ms each on a CPU). It publishes the newest matte, and the
-  video loop never waits for it.
+  video loop never waits for it. On the GPU, segmentation starts as soon as a frame arrives, runs while the board
+  is being deskewed, and the ghost waits (up to 30 ms) for that frame's matte, so you're cut out where you are now.
 - The matte is warped into board space, grown by 2.5% of the board height, and held for a few frames after you
   move, so the board memory never learns you.
 - The board memory is a per-pixel running average, updated only where you aren't. Small differences update slowly,
@@ -297,8 +300,9 @@ moved further than tracking can follow, it prints a hint to run `calibrate`. `--
   returns to about the board's own brightness. Chalk under the shadow can stay brighter than bare board, so any
   darkening within a few pixels of a shadow is held too (strokes are thin, so there is always shadowed board beside
   them). The threshold follows the room light (how much the whole board has dimmed or brightened), so changing
-  the lights isn't mistaken for a shadow. A faint shadow can stay above the threshold, so soft, diffuse light from the front (rather than one lamp
-  off to the side) still gives the cleanest board.
+  the lights isn't mistaken for a shadow. A faint shadow can stay above the threshold, so soft, diffuse light from
+  the front (rather than one lamp off to the side) still gives the cleanest board. The debug view (`d`) shows held
+  shadow in violet.
 - Output: the memory, with the live frame blended in at `--ghost-opacity` where the matte says there's a person.
 
 </details>
