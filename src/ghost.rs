@@ -8,6 +8,14 @@
 //!   once a pixel is still (temporal denoise of faint chalk); large ones (new chalk, erasing) only after the
 //!   pixel has been still for ~1/3 s, then quickly, so they arrive in about half a second. The stillness
 //!   requirement is what keeps a fast-moving hand that the laggy matte missed out of the memory.
+//! - Cast shadows: while someone is in the matte, a pixel that has gone clearly darker than the bare board around
+//!   it (`shadow_dark` of a coarse board-brightness estimate) is held, not learned. My shadow falls outside the
+//!   matte and keeps as still as I do, so the stillness test alone lets it in. Erasing still works: wiped chalk
+//!   goes back to about the board's own brightness, not well below it. Shadowed chalk can stay brighter than
+//!   bare board, so any darkening within `shadow_reach` of such a shadow pixel is held too: chalk strokes are thin,
+//!   so a stroke in a shadow always has shadowed board beside it. The threshold follows the room light: it is
+//!   scaled by how much the whole board has brightened or dimmed since the memory learned it (a median over the
+//!   board, which a shadow covering part of it doesn't move), so dimming the lights isn't taken for a shadow.
 //! - Output: the memory (optionally chalk-enhanced by the caller), then `overlay` blends the live frame in at
 //!   `opacity` where the matte says person.
 
@@ -59,15 +67,18 @@ pub mod debug {
     pub const HELD: u8 = 4;
     /// Frozen: me (the undilated matte).
     pub const PERSON: u8 = 5;
+    /// Frozen: clearly darker than the bare board while someone is in view, i.e. a cast shadow.
+    pub const SHADOW: u8 = 6;
     /// Colour difference from memory above which a small change counts as creeping rather than noise.
     pub const CREEP_DIFF: f32 = 8.0;
-    pub const NAMES: [&str; 6] = [
+    pub const NAMES: [&str; 7] = [
         "board",
         "creeping",
         "waiting",
         "accepting",
         "held",
         "person",
+        "shadow",
     ];
 }
 
@@ -90,6 +101,13 @@ pub struct GhostParams {
     pub settle: u8,
     /// Frames of stillness needed for the slow (denoising) update.
     pub settle_slow: u8,
+    /// While someone is in view, a pixel whose luma is below this fraction of the local bare-board luma is taken
+    /// to be in a cast shadow and held. A hard shadow under a board light measured about 0.42; erased chalk
+    /// returns to about 1.
+    pub shadow_dark: f32,
+    /// Darkening this close to a shadow pixel (fraction of board height) is held as shadow too: shadowed chalk,
+    /// which can stay brighter than bare board, and soft shadow edges. Wider than a chalk stroke's half-width.
+    pub shadow_reach: f32,
 }
 
 impl Default for GhostParams {
@@ -104,6 +122,8 @@ impl Default for GhostParams {
             motion: 14.0,
             settle: 10,
             settle_slow: 3,
+            shadow_dark: 0.8,
+            shadow_reach: 0.006,
         }
     }
 }
@@ -111,11 +131,13 @@ impl Default for GhostParams {
 // ------------------------------------------------------------------------------------------- worker
 
 struct Shared {
-    /// Newest frame waiting to be segmented (older ones are overwritten: we only care about the latest).
-    frame: Mutex<Option<Rgb>>,
+    /// Newest frame waiting to be segmented, with its number (older ones are overwritten: we only care about the
+    /// latest).
+    frame: Mutex<Option<(u64, Rgb)>>,
     ready: Condvar,
-    /// Newest matte and a counter bumped on every publish.
-    matte: Mutex<(u64, Vec<f32>)>,
+    /// Newest matte, a counter bumped on every publish, and the number of the frame it was made from.
+    matte: Mutex<(u64, Vec<f32>, u64)>,
+    matte_ready: Condvar,
     /// Whether to run pose (only while the picture-in-picture needs it), and its newest result + counter.
     pose_on: AtomicBool,
     person: Mutex<(u64, crate::pose::Person)>,
@@ -130,6 +152,8 @@ pub struct Segmenter {
     pub w: usize,
     pub h: usize,
     seen: u64,
+    /// Frames submitted so far (the last one's number).
+    submitted: u64,
     has_pose: bool,
     /// Segmentation runs on the GPU.
     pub gpu: bool,
@@ -153,7 +177,7 @@ impl Segmenter {
             Some(m) => match crate::pose::Pose::new(m, w, h, threads, gpu) {
                 Ok(p) => Some(p),
                 Err(e) => {
-                    crate::say!("head tracking falls back to the matte: {e:#}");
+                    crate::say!("no head tracking for the picture-in-picture: {e:#}");
                     None
                 }
             },
@@ -166,7 +190,8 @@ impl Segmenter {
         let shared = Arc::new(Shared {
             frame: Mutex::new(None),
             ready: Condvar::new(),
-            matte: Mutex::new((0, vec![0.0; w * h])),
+            matte: Mutex::new((0, vec![0.0; w * h], 0)),
+            matte_ready: Condvar::new(),
             pose_on: AtomicBool::new(false),
             person: Mutex::new((0, Default::default())),
             stop: AtomicBool::new(false),
@@ -188,11 +213,14 @@ impl Segmenter {
                         }
                         slot.take().unwrap()
                     };
+                    let (number, frame) = frame;
                     match matting.run(&frame, &mut alpha) {
                         Ok(()) => {
                             let mut m = sh.matte.lock().unwrap();
                             m.0 += 1;
                             m.1.copy_from_slice(&alpha);
+                            m.2 = number;
+                            sh.matte_ready.notify_all();
                         }
                         Err(e) => crate::say!("segmentation failed: {e:#}"),
                     }
@@ -223,6 +251,7 @@ impl Segmenter {
             w,
             h,
             seen: 0,
+            submitted: 0,
             has_pose,
             gpu,
         })
@@ -246,10 +275,22 @@ impl Segmenter {
             .take()
             .unwrap_or_else(|| Rgb::new(self.w, self.h));
         self.down.apply(frame, &mut small);
+        self.submitted += 1;
         let mut slot = self.shared.frame.lock().unwrap();
         // If the worker hasn't taken the previous frame yet, recycle it.
-        self.spare = slot.replace(small);
+        self.spare = slot.replace((self.submitted, small)).map(|(_, f)| f);
         self.shared.ready.notify_one();
+    }
+
+    /// Wait (at most `limit`) for the matte of the last frame submitted, so I'm cut out with my own outline
+    /// rather than the previous frame's. Worth it only when segmentation is fast (the GPU: ~8 ms).
+    pub fn wait_current(&self, limit: std::time::Duration) {
+        let m = self.shared.matte.lock().unwrap();
+        let _ = self
+            .shared
+            .matte_ready
+            .wait_timeout_while(m, limit, |m| m.2 < self.submitted)
+            .unwrap();
     }
 
     /// Copy out the newest matte if there's one we haven't seen.
@@ -276,6 +317,28 @@ impl Drop for Segmenter {
 
 // ------------------------------------------------------------------------------------------- compositor
 
+/// Longest the ghost waits for the current frame's matte on the GPU (it normally takes ~8 ms; a frame at 15 fps
+/// is 67 ms). Past this it uses the newest matte there is, as on the CPU.
+const MATTE_WAIT: std::time::Duration = std::time::Duration::from_millis(30);
+
+/// Board-brightness cells, in board pixels.
+const LEVEL_CELL: usize = 16;
+/// Frames between refreshes of the board-brightness estimate (the memory changes slowly).
+const LEVEL_REFRESH: u32 = 15;
+/// Share of a cell's pixels that must be bare board for its estimate to be bare board: the estimate is this
+/// percentile of the cell's luma, so chalk can cover up to three quarters of a cell.
+const LEVEL_PERCENTILE: f32 = 0.25;
+/// Share of segmentation pixels that must be person (alpha > 0.5) for someone to count as in view.
+const PRESENT_SHARE: f32 = 0.002;
+/// Frames someone still counts as in view after the matte last showed them (bridges matte flicker and lag).
+const PRESENT_HOLD: u32 = 15;
+/// Sampling stride (board pixels, both ways) for the board-wide live / memory brightness ratio.
+const LIGHT_STRIDE: usize = 8;
+
+fn luma(r: f32, g: f32, b: f32) -> f32 {
+    0.299 * r + 0.587 * g + 0.114 * b
+}
+
 pub struct Ghost {
     p: GhostParams,
     w: usize,
@@ -283,8 +346,6 @@ pub struct Ghost {
     /// Segmentation-space matte -> board canvas.
     mask_map: ResampleMap,
     seg_alpha: Vec<f32>,
-    /// Counts new mattes (for things that follow me, like the picture-in-picture).
-    matte_version: u64,
     /// Dilated matte in segmentation space (dilating there is ~30x cheaper than at board resolution).
     seg_grown: Vec<f32>,
     seg_scratch: Vec<f32>,
@@ -303,6 +364,21 @@ pub struct Ghost {
     still: Vec<u8>,
     /// What the memory did at each pixel on the last frame (see `debug`), for the debug view.
     state: Vec<u8>,
+    /// Bare-board luma per `LEVEL_CELL` cell of the memory (a low percentile, then a 3x3-cell median), and the
+    /// grid's width; refreshed every `LEVEL_REFRESH` frames.
+    level: Vec<f32>,
+    level_w: usize,
+    frames: u32,
+    /// Frames since the matte last showed someone (saturating).
+    away: u32,
+    /// Scratch for the brightness-ratio samples.
+    ratios: Vec<f32>,
+    /// Pixels clearly darker than bare board on the last frame (1 = shadow), and that grown by `reach` pixels:
+    /// darkening inside the grown map is held as shadow on the next frame.
+    dark: Vec<u8>,
+    dark_tmp: Vec<u8>,
+    near: Vec<u8>,
+    reach: usize,
     started: bool,
 }
 
@@ -320,6 +396,7 @@ impl Ghost {
     ) -> Self {
         let n = w * h;
         let seg_r = ((p.grow * h as f32 * seg_scale).round() as usize).max(1);
+        let reach = ((p.shadow_reach * h as f32).round() as usize).max(2);
         Ghost {
             seg_grown: vec![0.0; seg_w * seg_h],
             seg_scratch: vec![0.0; seg_w * seg_h],
@@ -331,7 +408,6 @@ impl Ghost {
             h,
             mask_map,
             seg_alpha: vec![0.0; seg_w * seg_h],
-            matte_version: 0,
             alpha: vec![0.0; n],
             grown: vec![0.0; n],
             hold: vec![0.0; n],
@@ -339,6 +415,15 @@ impl Ghost {
             prev: vec![0; n * 3],
             still: vec![0; n],
             state: vec![debug::BOARD; n],
+            level: vec![0.0; w.div_ceil(LEVEL_CELL) * h.div_ceil(LEVEL_CELL)],
+            level_w: w.div_ceil(LEVEL_CELL),
+            frames: 0,
+            away: u32::MAX,
+            ratios: Vec::new(),
+            dark: vec![0; n],
+            dark_tmp: vec![0; n],
+            near: vec![0; n],
+            reach,
             started: false,
         }
     }
@@ -346,8 +431,10 @@ impl Ghost {
     /// Update the board memory with this frame (taking the newest matte from the segmentation worker if there
     /// is one) and write the memory, without me, to `board`. Draw me over it afterwards with `overlay`.
     pub fn step(&mut self, live: &Rgb, seg: &mut Segmenter, board: &mut Rgb) {
+        if seg.gpu {
+            seg.wait_current(MATTE_WAIT);
+        }
         let fresh = seg.latest(&mut self.seg_alpha);
-        self.matte_version += fresh as u64;
         self.composite(live, fresh, board);
     }
 
@@ -359,11 +446,7 @@ impl Ghost {
         self.started = false;
         self.hold.fill(0.0);
         self.still.fill(0);
-    }
-
-    /// The latest person matte, in the (upright) segmentation frame: (matte, width, height, version).
-    pub fn matte(&self) -> (&[f32], usize, usize, u64) {
-        (&self.seg_alpha, self.seg_w, self.seg_h, self.matte_version)
+        self.near.fill(0);
     }
 
     pub fn opacity(&self) -> f32 {
@@ -423,6 +506,7 @@ impl Ghost {
                         }
                         debug::ACCEPTING => ([40.0, 255.0, 80.0], 0.7),
                         debug::CREEPING => ([0.0, 200.0, 230.0], 0.5),
+                        debug::SHADOW => ([150.0, 80.0, 220.0], 0.7),
                         _ => ([grey; 3], 0.0),
                     };
                     for c in 0..3 {
@@ -455,6 +539,10 @@ impl Ghost {
             );
             self.mask_map.apply_gray(&self.seg_alpha, &mut self.alpha);
             self.mask_map.apply_gray(&self.seg_grown, &mut self.grown);
+            let people = self.seg_alpha.iter().filter(|&&a| a > 0.5).count();
+            if people as f32 > PRESENT_SHARE * self.seg_alpha.len() as f32 {
+                self.away = 0;
+            }
         }
         if !self.started {
             for (m, &v) in self.memory.iter_mut().zip(&live.data) {
@@ -462,9 +550,18 @@ impl Ghost {
             }
             self.prev.copy_from_slice(&live.data);
             self.started = true;
+            self.frames = 0;
         }
+        if self.frames.is_multiple_of(LEVEL_REFRESH) {
+            self.refresh_level();
+        }
+        self.frames = self.frames.wrapping_add(1);
+        let present = self.away < PRESENT_HOLD;
+        self.away = self.away.saturating_add(1);
+        let light = if present { self.light_change(live) } else { 1.0 };
         let p = &self.p;
         let w = self.w;
+        let (level, level_w) = (&self.level, self.level_w);
         self.memory
             .par_chunks_mut(w * 3)
             .zip(out.data.par_chunks_mut(w * 3))
@@ -475,9 +572,16 @@ impl Ghost {
             .zip(self.still.par_chunks_mut(w))
             .zip(self.state.par_chunks_mut(w))
             .zip(self.alpha.par_chunks(w))
+            .zip(self.dark.par_chunks_mut(w))
+            .zip(self.near.par_chunks(w))
+            .enumerate()
             .with_min_len(ROWS_PER_TASK)
             .for_each(
-                |((((((((mem, out), live), hold), grown), prev), still), state), alpha)| {
+                |(
+                    y,
+                    ((((((((((mem, out), live), hold), grown), prev), still), state), alpha), dark), near),
+                )| {
+                    let level = &level[(y / LEVEL_CELL) * level_w..][..level_w];
                     for x in 0..w {
                         let i = x * 3;
                         let (r, g, b) = (live[i] as f32, live[i + 1] as f32, live[i + 2] as f32);
@@ -492,6 +596,7 @@ impl Ghost {
                             still[x].saturating_add(1)
                         };
                         hold[x] = grown[x].max(hold[x] * p.hold_decay);
+                        dark[x] = 0;
                         state[x] = if alpha[x] > 0.5 {
                             debug::PERSON
                         } else {
@@ -502,7 +607,17 @@ impl Ghost {
                                 .abs()
                                 .max((g - mem[i + 1]).abs())
                                 .max((b - mem[i + 2]).abs());
-                            let k = if d > p.ink_diff {
+                            let y_live = luma(r, g, b);
+                            let darker = present
+                                && d > debug::CREEP_DIFF
+                                && y_live < luma(mem[i], mem[i + 1], mem[i + 2]);
+                            dark[x] =
+                                (darker && y_live < p.shadow_dark * light * level[x / LEVEL_CELL]) as u8;
+                            let shadow = darker && (dark[x] == 1 || near[x] == 1);
+                            let k = if shadow {
+                                state[x] = debug::SHADOW;
+                                0.0
+                            } else if d > p.ink_diff {
                                 if still[x] >= p.settle {
                                     state[x] = debug::ACCEPTING;
                                     p.rate_fast
@@ -532,6 +647,124 @@ impl Ghost {
                     }
                 },
             );
+        // Grow this frame's shadow pixels for the next frame (a shadow keeps still, so a frame's lag is harmless).
+        if present {
+            spread(
+                &self.dark,
+                &mut self.dark_tmp,
+                &mut self.near,
+                w,
+                self.h,
+                self.reach,
+            );
+        } else {
+            self.near.fill(0);
+        }
+    }
+}
+
+/// Binary dilation of a 0/1 map by a square of radius `r`: horizontal by a sliding count, vertical by OR.
+fn spread(src: &[u8], tmp: &mut [u8], dst: &mut [u8], w: usize, h: usize, r: usize) {
+    tmp.par_chunks_mut(w)
+        .zip(src.par_chunks(w))
+        .with_min_len(ROWS_PER_TASK)
+        .for_each(|(o, s)| {
+            // Count of set pixels in [x - r, x + r], slid along the row.
+            let mut n: u32 = s[..r.min(w)].iter().map(|&v| v as u32).sum();
+            for x in 0..w {
+                if x + r < w {
+                    n += s[x + r] as u32;
+                }
+                if x > r {
+                    n -= s[x - r - 1] as u32;
+                }
+                o[x] = (n > 0) as u8;
+            }
+        });
+    dst.par_chunks_mut(w)
+        .enumerate()
+        .with_min_len(ROWS_PER_TASK)
+        .for_each(|(y, o)| {
+            o.fill(0);
+            for yy in y.saturating_sub(r)..=(y + r).min(h - 1) {
+                for (d, &v) in o.iter_mut().zip(&tmp[yy * w..(yy + 1) * w]) {
+                    *d |= v;
+                }
+            }
+        });
+}
+
+impl Ghost {
+    /// How much the room light has changed the board since the memory learned it: the median live / memory luma
+    /// ratio over a sparse sample of pixels clear of me. A shadow covers a minority of the board, so it barely
+    /// moves the median; dimming or brightening the lights moves all of it.
+    fn light_change(&mut self, live: &Rgb) -> f32 {
+        let (w, h) = (self.w, self.h);
+        self.ratios.clear();
+        for y in (LIGHT_STRIDE / 2..h).step_by(LIGHT_STRIDE) {
+            for x in (LIGHT_STRIDE / 2..w).step_by(LIGHT_STRIDE) {
+                let j = y * w + x;
+                if self.hold[j] >= 0.05 {
+                    continue;
+                }
+                let (m, l) = (&self.memory[j * 3..j * 3 + 3], &live.data[j * 3..j * 3 + 3]);
+                let ym = luma(m[0], m[1], m[2]);
+                if ym >= 8.0 {
+                    self.ratios
+                        .push(luma(l[0] as f32, l[1] as f32, l[2] as f32) / ym);
+                }
+            }
+        }
+        if self.ratios.len() < 50 {
+            return 1.0;
+        }
+        let k = self.ratios.len() / 2;
+        self.ratios
+            .select_nth_unstable_by(k, f32::total_cmp)
+            .1
+            .clamp(0.2, 3.0)
+    }
+
+    /// Re-estimate the bare-board luma per cell from the memory: a low percentile per cell (ignores chalk covering
+    /// up to three quarters of it), then a 3x3-cell median (ignores a cell that is all sticky note or writing).
+    fn refresh_level(&mut self) {
+        let (w, h, gw) = (self.w, self.h, self.level_w);
+        let gh = h.div_ceil(LEVEL_CELL);
+        let mem = &self.memory;
+        let cells: Vec<f32> = (0..gw * gh)
+            .into_par_iter()
+            .map(|ci| {
+                let (cx, cy) = (ci % gw, ci / gw);
+                let mut v = Vec::with_capacity(LEVEL_CELL * LEVEL_CELL);
+                for y in cy * LEVEL_CELL..((cy + 1) * LEVEL_CELL).min(h) {
+                    for x in cx * LEVEL_CELL..((cx + 1) * LEVEL_CELL).min(w) {
+                        let i = (y * w + x) * 3;
+                        v.push(luma(mem[i], mem[i + 1], mem[i + 2]));
+                    }
+                }
+                let k = ((v.len() - 1) as f32 * LEVEL_PERCENTILE) as usize;
+                *v.select_nth_unstable_by(k, f32::total_cmp).1
+            })
+            .collect();
+        self.level
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(ci, out)| {
+                let (cx, cy) = ((ci % gw) as isize, (ci / gw) as isize);
+                let mut v = [0.0f32; 9];
+                let mut n = 0;
+                for dy in -1..=1 {
+                    for dx in -1..=1 {
+                        let (x, y) = (cx + dx, cy + dy);
+                        if (0..gw as isize).contains(&x) && (0..gh as isize).contains(&y) {
+                            v[n] = cells[y as usize * gw + x as usize];
+                            n += 1;
+                        }
+                    }
+                }
+                let v = &mut v[..n];
+                *out = *v.select_nth_unstable_by(n / 2, f32::total_cmp).1;
+            });
     }
 }
 
@@ -651,6 +884,121 @@ mod tests {
         g.draw_debug(&mut out);
     }
 
+    /// Composite `f` with someone standing at the left edge of the board (segmentation x 0..2, y 2..6, i.e.
+    /// board x 0..20, y 20..60), as a fresh matte every frame.
+    fn with_person(g: &mut Ghost, f: &Rgb, out: &mut Rgb) {
+        for y in 0..8 {
+            for x in 0..12 {
+                g.seg_alpha[y * 12 + x] = if x < 2 && (2..6).contains(&y) { 1.0 } else { 0.0 };
+            }
+        }
+        g.composite(f, true, out);
+    }
+
+    fn dist(m: [f32; 3], c: [u8; 3]) -> f32 {
+        (0..3).map(|i| (m[i] - c[i] as f32).abs()).fold(0.0, f32::max)
+    }
+
+    #[test]
+    fn still_cast_shadow_stays_out_of_memory_while_someone_is_in_view() {
+        let mut g = blind_ghost();
+        let mut out = Rgb::new(120, 80);
+        with_person(&mut g, &frame(|_, _| None), &mut out);
+        // A hard shadow at 0.4x board brightness, well outside the grown matte, keeping perfectly still.
+        let shadow = BOARD.map(|c| (c as f32 * 0.4) as u8);
+        let shaded =
+            frame(|x, y| ((60..95).contains(&x) && (15..65).contains(&y)).then_some(shadow));
+        for _ in 0..60 {
+            with_person(&mut g, &shaded, &mut out);
+        }
+        for (x, y) in [(60, 15), (77, 40), (94, 64), (61, 30)] {
+            let m = mem_at(&g, x, y);
+            assert!(dist(m, BOARD) < 4.0, "shadow learned at ({x},{y}): {m:?}");
+            assert_eq!(g.state[y * 120 + x], debug::SHADOW);
+        }
+        // Once I'm gone (and my shadow with me) the memory is still the bare board.
+        for _ in 0..30 {
+            g.composite(&frame(|_, _| None), false, &mut out);
+        }
+        assert!(dist(mem_at(&g, 77, 40), BOARD) < 4.0);
+    }
+
+    #[test]
+    fn chalk_under_a_shadow_stays_as_it_was() {
+        let mut g = blind_ghost();
+        let mut out = Rgb::new(120, 80);
+        let stroke = |x: usize, y: usize| (50..90).contains(&x) && (38..41).contains(&y);
+        with_person(&mut g, &frame(|x, y| stroke(x, y).then_some(CHALK)), &mut out);
+        // The shadow covers the stroke. Shadowed chalk (0.4x) is still brighter than bare board, so on its own it
+        // looks like chalk being rubbed out; only the shadowed board around it gives it away.
+        let dim = |c: [u8; 3]| c.map(|v| (v as f32 * 0.4) as u8);
+        let shaded = frame(|x, y| {
+            ((60..95).contains(&x) && (15..65).contains(&y))
+                .then(|| dim(if stroke(x, y) { CHALK } else { BOARD }))
+                .or(stroke(x, y).then_some(CHALK))
+        });
+        for _ in 0..60 {
+            with_person(&mut g, &shaded, &mut out);
+        }
+        for x in [61, 70, 80, 89] {
+            let m = mem_at(&g, x, 39);
+            assert!(dist(m, CHALK) < 4.0, "shadowed chalk learned at x={x}: {m:?}");
+        }
+        assert!(dist(mem_at(&g, 77, 25), BOARD) < 4.0);
+    }
+
+    #[test]
+    fn dimming_the_room_light_is_not_a_shadow() {
+        let mut g = blind_ghost();
+        let mut out = Rgb::new(120, 80);
+        let chalk = |x: usize, y: usize| (50..90).contains(&x) && (38..41).contains(&y);
+        with_person(&mut g, &frame(|x, y| chalk(x, y).then_some(CHALK)), &mut out);
+        // The whole room dims to 0.6x, with my (still) shadow on part of the board.
+        let dim = |c: [u8; 3], k: f32| c.map(|v| (v as f32 * k) as u8);
+        let dimmed = frame(|x, y| {
+            let base = if chalk(x, y) { CHALK } else { BOARD };
+            Some(if (100..115).contains(&x) && (15..65).contains(&y) {
+                dim(base, 0.6 * 0.4)
+            } else {
+                dim(base, 0.6)
+            })
+        });
+        for _ in 0..90 {
+            with_person(&mut g, &dimmed, &mut out);
+        }
+        for (x, y) in [(40, 10), (77, 70), (60, 39)] {
+            let want = dim(if chalk(x, y) { CHALK } else { BOARD }, 0.6);
+            let m = mem_at(&g, x, y);
+            assert!(dist(m, want) < 4.0, "room dimming not learned at ({x},{y}): {m:?}");
+        }
+        // The shadow is still a shadow against the dimmed board.
+        assert!(dist(mem_at(&g, 107, 40), BOARD) < 4.0);
+        assert_eq!(g.state[40 * 120 + 107], debug::SHADOW);
+    }
+
+    #[test]
+    fn erasing_goes_in_while_someone_is_in_view() {
+        let mut g = blind_ghost();
+        let mut out = Rgb::new(120, 80);
+        let chalked =
+            frame(|x, y| ((50..70).contains(&x) && (38..42).contains(&y)).then_some(CHALK));
+        with_person(&mut g, &chalked, &mut out);
+        assert!(dist(mem_at(&g, 60, 40), CHALK) < 1.0);
+        // Wiped back to the board (a little lighter, as wiped chalk is).
+        let wiped = frame(|x, y| {
+            ((50..70).contains(&x) && (38..42).contains(&y)).then_some(BOARD.map(|c| c + 6))
+        });
+        let mut gone = None;
+        for t in 1..=30 {
+            with_person(&mut g, &wiped, &mut out);
+            if gone.is_none() && dist(mem_at(&g, 60, 40), BOARD) < 24.0 {
+                gone = Some(t);
+            }
+        }
+        let t = gone.expect("erasure never went in");
+        assert!(t <= 15, "erasure took {t} frames");
+    }
+
     #[test]
     fn g_cycles_hidden_faint_ghost_opaque() {
         let mut o = 0.25; // the default
@@ -661,6 +1009,21 @@ mod tests {
         }
         assert_eq!(seen, [0.5, 1.0, 0.0, 0.1, 0.25, 0.5]);
         assert_eq!(next_opacity(0.4), 0.5); // a custom --ghost-opacity
+    }
+
+    #[test]
+    fn spread_grows_a_point_into_a_square() {
+        let (w, h) = (9, 7);
+        let mut src = vec![0u8; w * h];
+        src[3 * w + 4] = 1;
+        let (mut tmp, mut dst) = (vec![0; w * h], vec![0; w * h]);
+        spread(&src, &mut tmp, &mut dst, w, h, 2);
+        for y in 0..h {
+            for x in 0..w {
+                let inside = (1..=5).contains(&y) && (2..=6).contains(&x);
+                assert_eq!(dst[y * w + x], inside as u8, "({x},{y})");
+            }
+        }
     }
 
     #[test]

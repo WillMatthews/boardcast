@@ -860,7 +860,7 @@ fn run(
         )?;
         if !args.pose_model.exists() {
             say!(
-                "no pose model ({}): picture-in-picture follows the matte instead (scripts/fetch-pose-model.sh)",
+                "no pose model ({}): the picture-in-picture has nothing to follow (scripts/fetch-pose-model.sh)",
                 args.pose_model.display()
             );
         }
@@ -972,6 +972,11 @@ fn run(
             if let Err(e) = save_corners(config_path, &c) {
                 say!("warning: couldn't save the new corners: {e:#}");
             }
+        }
+        // Segmentation starts on this frame now and runs while the board is warped (on the GPU, the ghost then
+        // waits for this frame's matte rather than drawing me with the previous one).
+        if let Some((seg, _, _)) = &mut ghost {
+            seg.submit(&frame);
         }
         board_map.apply(&frame, &mut board);
         if last_sharpness.elapsed() >= Duration::from_secs(1) {
@@ -1104,7 +1109,6 @@ fn run(
         // Board memory (or the live board) -> chalk enhancement -> me drawn over it.
         let shown = match &mut ghost {
             Some((seg, g, out)) => {
-                seg.submit(&frame);
                 g.step(&board, seg, out);
                 if debug_view {
                     g.draw_debug(out);
@@ -1125,14 +1129,6 @@ fn run(
                     if let Some((version, person)) = person {
                         pip.track_head(version, person.head, (seg.w, seg.h), up);
                     }
-                    let (m, mw, mh, version) = g.matte();
-                    pip.track(
-                        m,
-                        mw,
-                        mh,
-                        version,
-                        image::upright_size((cam.w, cam.h), cfg.rotate),
-                    );
                     pip.draw(&frame, cfg.rotate, out);
                     &*out
                 }

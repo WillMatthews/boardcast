@@ -1,7 +1,7 @@
 //! Picture-in-picture: a squircle crop of me, following my head, inset in a corner of the board feed.
 //!
-//! The head is found from the person matte (segmentation frame): the top of the matte, with the head's width from
-//! the first rows below it. The crop is a square a few head-widths across, so it frames me the same at the board
+//! The head is found by YOLO pose (see `pose`), and nothing else: a raised arm can't pull the crop off my head.
+//! The crop is a square a few head-widths across, so it frames me the same at the board
 //! or at the desk, and is smoothed so it glides rather than jitters.
 
 use std::time::Instant;
@@ -51,17 +51,18 @@ pub struct Pip {
     fade: f32,
     seen: Option<Instant>,
     last: Instant,
-    /// Version of the matte the crop was last updated from (update once per new matte).
-    matte_seen: u64,
-    /// Pose results: the last one used, when pose last found me, and the last head width it measured (in upright
-    /// camera pixels) for frames where it can't tell.
+    /// Pose results: the last one used, and the last head width it measured (in upright camera pixels) for
+    /// frames where it can't tell.
     head_seen: u64,
-    pose_found: Option<Instant>,
     head_width: Option<f32>,
     patch: Rgb,
     /// Where the inset is drawn (top-left, canvas pixels) and how fast it's moving: it glides between corners.
     at: Option<[f32; 2]>,
     at_v: [f32; 2],
+    /// Smoothed frame interval for the glide: frames go out at the camera's steady rate, but the time between
+    /// `draw` calls jitters with processing (enhancement runs every few frames), and stepping the glide by the raw
+    /// interval makes uneven jumps.
+    frame_dt: f32,
 }
 
 impl Pip {
@@ -75,46 +76,13 @@ impl Pip {
             fade: 0.0,
             seen: None,
             last: Instant::now(),
-            matte_seen: u64::MAX,
             head_seen: u64::MAX,
-            pose_found: None,
             head_width: None,
             patch: Rgb::new(1, 1),
             at: None,
             at_v: [0.0; 2],
+            frame_dt: 1.0 / 15.0,
         }
-    }
-
-    /// Follow my head in the matte (`mw` x `mh`, the upright frame scaled down); `version` changes with each new
-    /// matte.
-    pub fn track(
-        &mut self,
-        matte: &[f32],
-        mw: usize,
-        mh: usize,
-        version: u64,
-        upright: (usize, usize),
-    ) {
-        if version == self.matte_seen {
-            return;
-        }
-        self.matte_seen = version;
-        // Pose is better at finding my head (raised arms don't fool it); the matte is the fallback.
-        if self
-            .pose_found
-            .is_some_and(|t| t.elapsed().as_secs_f32() < 0.6)
-        {
-            return;
-        }
-        let Some([cx, top, hw]) = find_head(matte, mw, mh) else {
-            return;
-        };
-        let k = upright.0 as f32 / mw as f32;
-        let side =
-            (hw * k * HEAD_WIDTHS).clamp(upright.0 as f32 * 0.12, upright.0.min(upright.1) as f32);
-        let target = [cx * k, top * k - HEAD_TOP * side + side / 2.0, side];
-        self.seen = Some(Instant::now());
-        self.measured = Some(target);
     }
 
     /// Follow my head as found by pose (`head` in the `seg` frame's pixels, `version` changes with each run).
@@ -139,15 +107,8 @@ impl Pip {
             (hw * HEAD_WIDTHS).clamp(upright.0 as f32 * 0.12, upright.0.min(upright.1) as f32);
         // Eye level is about 0.55 head widths below the top of the head.
         let top = h.y * k - 0.55 * hw;
-        self.pose_found = Some(Instant::now());
         self.seen = Some(Instant::now());
         self.measured = Some([h.x * k, top - HEAD_TOP * side + side / 2.0, side]);
-    }
-
-    /// Whether pose is currently finding me (for the status display).
-    pub fn using_pose(&self) -> bool {
-        self.pose_found
-            .is_some_and(|t| t.elapsed().as_secs_f32() < 0.6)
     }
 
     /// Draw the inset onto `out`, cropping from the camera `frame` (turned `rot` to upright).
@@ -279,15 +240,11 @@ impl Pip {
             Corner::BottomLeft => [margin, bottom],
         }
         .map(|v| v as f32);
-        // Critically damped spring towards the corner: eases out and in, ~0.6 s across the feed.
-        let at = self.at.get_or_insert(goal);
-        let w = 9.0;
-        let dt = dt.clamp(0.0, 0.1);
-        for i in 0..2 {
-            let a = w * w * (goal[i] - at[i]) - 2.0 * w * self.at_v[i];
-            self.at_v[i] += a * dt;
-            at[i] += self.at_v[i] * dt;
-        }
+        self.frame_dt += 0.1 * (dt.clamp(0.0, 0.2) - self.frame_dt);
+        let at = *self.at.get_or_insert(goal);
+        let (at, v) = glide(at, self.at_v, goal, self.frame_dt);
+        self.at = Some(at);
+        self.at_v = v;
         let (ox, oy) = (at[0].round() as isize, at[1].round() as isize);
         let r = p as f32 / 2.0;
         let pad = SHADOW as isize + 2;
@@ -354,14 +311,7 @@ impl Pip {
             self.seen.is_some_and(|t| t.elapsed().as_secs_f32() < 1.5),
         ) {
             (false, _) => "off".into(),
-            (true, true) => format!(
-                "on, {corner}, following {}",
-                if self.using_pose() {
-                    "pose"
-                } else {
-                    "the matte"
-                }
-            ),
+            (true, true) => format!("on, {corner}, following you"),
             (true, false) => format!("on, {corner} (waiting to see you)"),
         }
     }
@@ -419,35 +369,22 @@ impl CropFilter {
     }
 }
 
-/// [head centre x, head top y, head width] in matte pixels, or None if there's no person.
-fn find_head(m: &[f32], w: usize, h: usize) -> Option<[f32; 3]> {
-    const ON: f32 = 0.5;
-    let row_span = |y: usize| {
-        let row = &m[y * w..(y + 1) * w];
-        let first = row.iter().position(|&a| a > ON)?;
-        let last = row.iter().rposition(|&a| a > ON)?;
-        Some((first, last))
-    };
-    // Top of the person: the first row with a run of a few person pixels (ignores specks).
-    let top = (0..h).find(|&y| row_span(y).is_some_and(|(a, b)| b - a >= 3))?;
-    // Head: rows from the top down ~ one head height (about 6% of the frame), median width and centre.
-    let band = ((h as f32 * 0.06) as usize).max(3);
-    let mut widths = Vec::new();
-    let mut centres = Vec::new();
-    for y in top..(top + band).min(h) {
-        if let Some((a, b)) = row_span(y) {
-            widths.push((b - a + 1) as f32);
-            centres.push((a + b + 1) as f32 / 2.0);
-        }
+/// Glide speed: a critically damped spring of this angular frequency (1/s) gets 95% of the way in about 4.7/GLIDE_W
+/// seconds (~0.8 s), peaking at about 0.37 * GLIDE_W of the distance per second.
+const GLIDE_W: f32 = 6.0;
+
+/// One step of a critically damped spring from `x` (velocity `v`) towards `goal`, solved exactly for `dt` so the
+/// motion doesn't depend on the step size.
+fn glide(x: [f32; 2], v: [f32; 2], goal: [f32; 2], dt: f32) -> ([f32; 2], [f32; 2]) {
+    let (w, e) = (GLIDE_W, (-GLIDE_W * dt).exp());
+    let (mut nx, mut nv) = ([0.0; 2], [0.0; 2]);
+    for i in 0..2 {
+        let d = x[i] - goal[i];
+        let c = v[i] + w * d;
+        nx[i] = goal[i] + (d + c * dt) * e;
+        nv[i] = (v[i] - w * c * dt) * e;
     }
-    if widths.len() < 2 {
-        return None;
-    }
-    widths.sort_by(f32::total_cmp);
-    centres.sort_by(f32::total_cmp);
-    // The widest part of the band is the head proper (the crown is narrower).
-    let hw = widths[widths.len() * 3 / 4];
-    Some([centres[centres.len() / 2], top as f32, hw])
+    (nx, nv)
 }
 
 fn bilinear(img: &Rgb, x: f32, y: f32) -> [f32; 3] {
@@ -467,22 +404,6 @@ fn bilinear(img: &Rgb, x: f32, y: f32) -> [f32; 3] {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// A stick figure in a 100x160 matte: head a 12-wide disc at x=40, top at y=30; body below.
-    fn figure() -> Vec<f32> {
-        let (w, h) = (100, 160);
-        let mut m = vec![0.0; w * h];
-        for y in 0..h {
-            for x in 0..w {
-                let head = (x as f32 - 40.0).powi(2) + (y as f32 - 36.0).powi(2) < 36.0;
-                let body = y >= 44 && (26..=54).contains(&x);
-                if head || body {
-                    m[y * w + x] = 1.0;
-                }
-            }
-        }
-        m
-    }
 
     /// Simulate: measurements at 10 Hz with noise, frames at 25 Hz. Returns the filtered x per frame.
     fn simulate(
@@ -638,12 +559,26 @@ mod tests {
     }
 
     #[test]
-    fn finds_the_head() {
-        let [cx, top, hw] = find_head(&figure(), 100, 160).expect("no head");
-        assert!((cx - 40.0).abs() < 1.5, "centre {cx}");
-        assert!((top - 30.0).abs() < 1.5, "top {top}");
-        assert!((9.0..=13.0).contains(&hw), "head width {hw}");
-        assert!(find_head(&vec![0.0; 100 * 160], 100, 160).is_none());
+    fn glide_is_smooth_and_settles_in_under_a_second() {
+        let (mut x, mut v, goal) = ([0.0; 2], [0.0; 2], [600.0, 0.0]);
+        let mut steps = Vec::new();
+        for _ in 0..15 {
+            let (nx, nv) = glide(x, v, goal, 1.0 / 15.0);
+            steps.push(nx[0] - x[0]);
+            (x, v) = (nx, nv);
+        }
+        assert!((goal[0] - x[0]).abs() < 0.05 * 600.0, "not there after 1 s: {x:?}");
+        // Never overshoots, and the step size rises then falls without lurching.
+        assert!(steps.iter().all(|&s| s >= 0.0), "{steps:?}");
+        for p in steps.windows(2) {
+            assert!((p[1] - p[0]).abs() < 0.12 * 600.0, "lurch: {steps:?}");
+        }
+        // The exact step gives the same path at any frame rate.
+        let (mut y, mut u) = ([0.0; 2], [0.0; 2]);
+        for _ in 0..30 {
+            (y, u) = glide(y, u, goal, 1.0 / 30.0);
+        }
+        assert!((y[0] - x[0]).abs() < 0.01, "{y:?} vs {x:?}");
     }
 
     #[test]
@@ -651,7 +586,12 @@ mod tests {
         let mut frame = Rgb::new(200, 320);
         frame.data.fill(200);
         let mut pip = Pip::new(0.3, Corner::TopLeft, true);
-        pip.track(&figure(), 100, 160, 1, (200, 320));
+        let head = crate::pose::Head {
+            x: 40.0,
+            y: 36.0,
+            width: Some(12.0),
+        };
+        pip.track_head(1, Some(head), (100, 160), (200, 320));
         pip.fade = 1.0;
         pip.last = Instant::now();
         let mut out = Rgb::new(400, 500);

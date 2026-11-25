@@ -95,7 +95,7 @@ scripts/loopback.sh
 
 ```sh
 scripts/fetch-model.sh       # person segmentation (Robust Video Matting, ~15 MB); needed for ghost mode
-scripts/fetch-pose-model.sh  # optional: head finding for the picture-in-picture (needs uv)
+scripts/fetch-pose-model.sh  # optional: needed for the picture-in-picture (needs uv)
 ```
 
 #### Segmenting on an NVIDIA GPU
@@ -191,7 +191,8 @@ memory. The status display shows what share of the board is in each state.
 |---|---|
 | blue | you (the segmentation matte); frozen |
 | magenta | held: the grown matte around you, and its hold after you move, fading as it decays; frozen |
-| red → yellow | a big change (new chalk, erasing, a shadow) waiting for the pixel to keep still; yellow is nearly there |
+| violet | your cast shadow: clearly darker than the bare board while you're in view; frozen |
+| red → yellow | a big change (new chalk, erasing) waiting for the pixel to keep still; yellow is nearly there |
 | green | a big change going into memory now |
 | cyan | a small change creeping in at the slow rate (faint chalk, a soft shadow edge) |
 | none | matches the memory |
@@ -222,9 +223,8 @@ in-camera sharpening inflates it.
 
 A rounded crop of you, inset in a corner of the board feed. It doesn't change the feed's resolution, so meeting apps
 don't notice it coming and going. It follows your head and frames you the same whether you're at the board or close
-to the camera, and it fades out when you leave. With the pose model (`scripts/fetch-pose-model.sh`) it finds your
-head even when your back is turned or your arms are raised; without it, it follows the top of the person
-segmentation. It needs ghost mode. Use `--pip-size` (a fraction of the feed's width, default 0.3) and `--pip-corner`
+to the camera, and it fades out when you leave. It finds your head with a YOLO pose model, even when your back is
+turned or your arms are raised, so it needs that model (`scripts/fetch-pose-model.sh`) as well as ghost mode. Use `--pip-size` (a fraction of the feed's width, default 0.3) and `--pip-corner`
 to set it up.
 
 ### Board light (optional)
@@ -291,6 +291,14 @@ moved further than tracking can follow, it prints a hint to run `calibrate`. `--
   which removes noise from faint chalk. Big ones (new chalk, erasing) are only accepted once a pixel has been still
   for about 1/3 s, so a moving hand that the matte missed is never absorbed. Accepted changes appear in about half a
   second.
+- Your shadow falls outside the matte and keeps as still as you do, so stillness alone would let it in. While
+  you're in view, a pixel that has gone clearly darker than the bare board around it (under 0.8× a coarse estimate
+  of the board's brightness) is treated as shadow and not learned. Erasing still goes in, because wiped chalk
+  returns to about the board's own brightness. Chalk under the shadow can stay brighter than bare board, so any
+  darkening within a few pixels of a shadow is held too (strokes are thin, so there is always shadowed board beside
+  them). The threshold follows the room light (how much the whole board has dimmed or brightened), so changing
+  the lights isn't mistaken for a shadow. A faint shadow can stay above the threshold, so soft, diffuse light from the front (rather than one lamp
+  off to the side) still gives the cleanest board.
 - Output: the memory, with the live frame blended in at `--ghost-opacity` where the matte says there's a person.
 
 </details>

@@ -141,12 +141,13 @@ fn ago(t: Instant) -> String {
 }
 
 fn render(f: &mut ratatui::Frame, s: &Status) {
+    let key_lines = key_lines(f.area().width);
     let [title, top, mid, log, keys] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(7),
         Constraint::Length(6),
         Constraint::Min(3),
-        Constraint::Length(1),
+        Constraint::Length(key_lines.len() as u16),
     ])
     .areas(f.area());
 
@@ -250,6 +251,7 @@ fn render(f: &mut ratatui::Frame, s: &Status) {
             Color::LightGreen,
             Color::Magenta,
             Color::LightBlue,
+            Color::Rgb(150, 80, 220),
         ];
         let mut v = Vec::new();
         for ((name, share), colour) in NAMES.iter().zip(shares).zip(COLOURS) {
@@ -317,27 +319,60 @@ fn render(f: &mut ratatui::Frame, s: &Status) {
         log,
     );
 
-    let key = |k: &'static str, what: &'static str| {
-        vec![
-            Span::styled(format!(" {k} "), Style::new().black().on_gray()),
-            Span::raw(format!(" {what}  ")),
-        ]
-    };
-    let mut spans = Vec::new();
-    for (k, w) in [
-        ("l", "look"),
-        ("g", "ghost"),
-        ("p", "picture-in-picture"),
-        ("o", "move it"),
-        ("d", "debug"),
-        ("b", "light"),
-        ("-=", "brightness"),
-        ("k", "colour"),
-        ("f", "focus"),
-        (",.", "adjust"),
-        ("q", "quit"),
-    ] {
-        spans.extend(key(k, w));
+    f.render_widget(Paragraph::new(key_lines), keys);
+}
+
+const KEYS: [(&str, &str); 11] = [
+    ("l", "look"),
+    ("g", "ghost"),
+    ("p", "picture-in-picture"),
+    ("o", "move it"),
+    ("d", "debug"),
+    ("b", "light"),
+    ("-=", "brightness"),
+    ("k", "colour"),
+    ("f", "focus"),
+    (",.", "adjust"),
+    ("q", "quit"),
+];
+
+/// The key bar, wrapped onto as many lines as `width` needs, never splitting a key from its label.
+fn key_lines(width: u16) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::default()];
+    for (k, what) in KEYS {
+        let (k, what) = (format!(" {k} "), format!(" {what}  "));
+        let n = (k.len() + what.len()) as u16;
+        let last = lines.last_mut().unwrap();
+        if last.width() > 0 && last.width() as u16 + n > width {
+            lines.push(Line::default());
+        }
+        let last = lines.last_mut().unwrap();
+        last.push_span(Span::styled(k, Style::new().black().on_gray()));
+        last.push_span(Span::raw(what));
     }
-    f.render_widget(Line::from(spans), keys);
+    lines
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn key_bar_wraps_whole_keys_to_the_width() {
+        let all: usize = KEYS.iter().map(|(k, w)| k.len() + w.len() + 5).sum();
+        assert_eq!(key_lines(all as u16).len(), 1);
+        assert_eq!(key_lines(all as u16 - 1).len(), 2);
+        for width in [40u16, 60, 80, 100] {
+            let lines = key_lines(width);
+            assert!(lines.len() > 1, "width {width}");
+            assert!(lines.iter().all(|l| l.width() <= width as usize), "width {width}");
+            let text: String = lines
+                .iter()
+                .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+                .collect();
+            for (k, w) in KEYS {
+                assert!(text.contains(&format!(" {k}  {w}  ")), "{k} split at width {width}");
+            }
+        }
+    }
 }
