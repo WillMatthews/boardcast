@@ -37,6 +37,8 @@ pub struct Status<'a> {
     pub look: Look,
     /// Ghost opacity; None when ghost mode is off.
     pub ghost: Option<f32>,
+    /// While the debug view is on: share of board pixels in each memory state (`ghost::debug::NAMES` order).
+    pub debug: Option<[f32; crate::ghost::debug::NAMES.len()]>,
     /// Picture-in-picture state; None without ghost mode.
     pub pip: Option<String>,
     /// Board light state; None without light control.
@@ -238,6 +240,26 @@ fn render(f: &mut ratatui::Frame, s: &Status) {
             kv("ghost", v)
         }
     });
+    if let Some(shares) = s.debug {
+        use crate::ghost::debug::NAMES;
+        // Same colours as the debug view (board has none there).
+        const COLOURS: [Color; NAMES.len()] = [
+            Color::Gray,
+            Color::Cyan,
+            Color::LightRed,
+            Color::LightGreen,
+            Color::Magenta,
+            Color::LightBlue,
+        ];
+        let mut v = Vec::new();
+        for ((name, share), colour) in NAMES.iter().zip(shares).zip(COLOURS) {
+            v.push(Span::styled(
+                format!("{name} {:.1}%  ", share * 100.0),
+                Style::new().fg(colour),
+            ));
+        }
+        lines.push(kv("debug", v));
+    }
     lines.push(match &s.pip {
         None => kv("pip", "needs ghost mode".dark_gray()),
         Some(d) => kv("pip", vec![dot(d != "off"), d.clone().into()]),
@@ -307,6 +329,7 @@ fn render(f: &mut ratatui::Frame, s: &Status) {
         ("g", "ghost"),
         ("p", "picture-in-picture"),
         ("o", "move it"),
+        ("d", "debug"),
         ("b", "light"),
         ("-=", "brightness"),
         ("k", "colour"),

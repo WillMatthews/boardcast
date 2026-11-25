@@ -44,6 +44,33 @@ pub fn describe(opacity: f32) -> String {
     }
 }
 
+/// What the board memory did at a pixel on the last frame, for the debug view (`d`).
+pub mod debug {
+    /// Matches the memory (within noise); denoised slowly.
+    pub const BOARD: u8 = 0;
+    /// A small change (below `ink_diff`, above `CREEP_DIFF`): faint chalk or a soft shadow edge, fading in at
+    /// the slow rate.
+    pub const CREEPING: u8 = 1;
+    /// A big change waiting for the pixel to keep still for `settle` frames.
+    pub const WAITING: u8 = 2;
+    /// A big change going into memory at the fast rate.
+    pub const ACCEPTING: u8 = 3;
+    /// Frozen: inside the grown matte, or its hold after I've moved on.
+    pub const HELD: u8 = 4;
+    /// Frozen: me (the undilated matte).
+    pub const PERSON: u8 = 5;
+    /// Colour difference from memory above which a small change counts as creeping rather than noise.
+    pub const CREEP_DIFF: f32 = 8.0;
+    pub const NAMES: [&str; 6] = [
+        "board",
+        "creeping",
+        "waiting",
+        "accepting",
+        "held",
+        "person",
+    ];
+}
+
 pub struct GhostParams {
     /// How visible I am over the board (0 = invisible, 1 = fully live).
     pub opacity: f32,
@@ -104,6 +131,8 @@ pub struct Segmenter {
     pub h: usize,
     seen: u64,
     has_pose: bool,
+    /// Segmentation runs on the GPU.
+    pub gpu: bool,
 }
 
 impl Segmenter {
@@ -114,12 +143,14 @@ impl Segmenter {
         (w, h): (usize, usize),
         ratio: f32,
         threads: usize,
-        max_fps: f32,
+        gpu: bool,
+        max_fps: Option<f32>,
         pose_model: Option<&Path>,
     ) -> Result<Self> {
-        let mut matting = Matting::new(model, w, h, ratio, threads)?;
+        let mut matting = Matting::new(model, w, h, ratio, threads, gpu)?;
+        let gpu = matting.gpu;
         let mut pose = match pose_model {
-            Some(m) => match crate::pose::Pose::new(m, w, h, threads) {
+            Some(m) => match crate::pose::Pose::new(m, w, h, threads, gpu) {
                 Ok(p) => Some(p),
                 Err(e) => {
                     crate::say!("head tracking falls back to the matte: {e:#}");
@@ -129,6 +160,8 @@ impl Segmenter {
             None => None,
         };
         let has_pose = pose.is_some();
+        // On the GPU a run is a few ms, so by default keep up with the camera; on the CPU cap at 10 Hz.
+        let max_fps = max_fps.unwrap_or(if gpu { 1000.0 } else { 10.0 });
         let min_period = std::time::Duration::from_secs_f32(1.0 / max_fps.max(0.1));
         let shared = Arc::new(Shared {
             frame: Mutex::new(None),
@@ -175,7 +208,7 @@ impl Segmenter {
                             Err(e) => crate::say!("pose failed: {e:#}"),
                         }
                     }
-                    // Cap the rate; the compositor's stillness gate tolerates matte lag, so ~10 Hz is plenty.
+                    // Cap the rate; the compositor's stillness gate tolerates matte lag, so ~10 Hz is plenty on the CPU.
                     // Sleeping here (not before the run) means the next run takes the freshest frame.
                     if let Some(rest) = min_period.checked_sub(started.elapsed()) {
                         std::thread::sleep(rest);
@@ -191,6 +224,7 @@ impl Segmenter {
             h,
             seen: 0,
             has_pose,
+            gpu,
         })
     }
 
@@ -267,6 +301,8 @@ pub struct Ghost {
     prev: Vec<u8>,
     /// Consecutive frames each pixel has been still.
     still: Vec<u8>,
+    /// What the memory did at each pixel on the last frame (see `debug`), for the debug view.
+    state: Vec<u8>,
     started: bool,
 }
 
@@ -302,6 +338,7 @@ impl Ghost {
             memory: vec![0.0; n * 3],
             prev: vec![0; n * 3],
             still: vec![0; n],
+            state: vec![debug::BOARD; n],
             started: false,
         }
     }
@@ -357,6 +394,53 @@ impl Ghost {
             });
     }
 
+    /// Debug view: paint over `out` (which holds the memory, as `step` wrote it) what the memory did at each
+    /// pixel on the last frame. The memory shows through as a dim grey so the writing stays readable.
+    pub fn draw_debug(&self, out: &mut Rgb) {
+        assert_eq!((out.w, out.h), (self.w, self.h));
+        let (w, settle) = (self.w, self.p.settle.max(1) as f32);
+        out.data
+            .par_chunks_mut(w * 3)
+            .zip(self.state.par_chunks(w))
+            .zip(self.still.par_chunks(w))
+            .zip(self.hold.par_chunks(w))
+            .with_min_len(ROWS_PER_TASK)
+            .for_each(|(((out, state), still), hold)| {
+                for x in 0..w {
+                    let i = x * 3;
+                    let grey = 0.6
+                        * (0.299 * out[i] as f32
+                            + 0.587 * out[i + 1] as f32
+                            + 0.114 * out[i + 2] as f32);
+                    let (tint, mix) = match state[x] {
+                        debug::PERSON => ([60.0, 110.0, 255.0], 0.55),
+                        // Stronger where the hold is fresh, fading as it decays.
+                        debug::HELD => ([230.0, 60.0, 230.0], 0.2 + 0.4 * hold[x].min(1.0)),
+                        // Red when the pixel has just moved, through orange to yellow as it nears `settle`.
+                        debug::WAITING => {
+                            let p = (still[x] as f32 / settle).min(1.0);
+                            ([255.0, 40.0 + 200.0 * p, 0.0], 0.7)
+                        }
+                        debug::ACCEPTING => ([40.0, 255.0, 80.0], 0.7),
+                        debug::CREEPING => ([0.0, 200.0, 230.0], 0.5),
+                        _ => ([grey; 3], 0.0),
+                    };
+                    for c in 0..3 {
+                        out[i + c] = (grey + mix * (tint[c] - grey)).round() as u8;
+                    }
+                }
+            });
+    }
+
+    /// Share of board pixels in each debug state on the last frame, in `debug::NAMES` order.
+    pub fn debug_shares(&self) -> [f32; debug::NAMES.len()] {
+        let mut n = [0usize; debug::NAMES.len()];
+        for &s in &self.state {
+            n[s as usize] += 1;
+        }
+        n.map(|c| c as f32 / self.state.len().max(1) as f32)
+    }
+
     /// Update the memory with one frame and write it to `out`. `fresh` says `seg_alpha` holds a new matte.
     fn composite(&mut self, live: &Rgb, fresh: bool, out: &mut Rgb) {
         assert_eq!((live.w, live.h), (self.w, self.h));
@@ -389,47 +473,65 @@ impl Ghost {
             .zip(self.grown.par_chunks(w))
             .zip(self.prev.par_chunks_mut(w * 3))
             .zip(self.still.par_chunks_mut(w))
+            .zip(self.state.par_chunks_mut(w))
+            .zip(self.alpha.par_chunks(w))
             .with_min_len(ROWS_PER_TASK)
-            .for_each(|((((((mem, out), live), hold), grown), prev), still)| {
-                for x in 0..w {
-                    let i = x * 3;
-                    let (r, g, b) = (live[i] as f32, live[i + 1] as f32, live[i + 2] as f32);
-                    let moved = (0..3)
-                        .map(|c| (live[i + c] as i16 - prev[i + c] as i16).unsigned_abs())
-                        .max()
-                        .unwrap() as f32;
-                    prev[i..i + 3].copy_from_slice(&live[i..i + 3]);
-                    still[x] = if moved > p.motion {
-                        0
-                    } else {
-                        still[x].saturating_add(1)
-                    };
-                    hold[x] = grown[x].max(hold[x] * p.hold_decay);
-                    if hold[x] < 0.05 {
-                        let d = (r - mem[i])
-                            .abs()
-                            .max((g - mem[i + 1]).abs())
-                            .max((b - mem[i + 2]).abs());
-                        let k = if d > p.ink_diff {
-                            if still[x] >= p.settle {
-                                p.rate_fast
-                            } else {
-                                0.0
-                            }
-                        } else if still[x] >= p.settle_slow {
-                            p.rate_slow
+            .for_each(
+                |((((((((mem, out), live), hold), grown), prev), still), state), alpha)| {
+                    for x in 0..w {
+                        let i = x * 3;
+                        let (r, g, b) = (live[i] as f32, live[i + 1] as f32, live[i + 2] as f32);
+                        let moved = (0..3)
+                            .map(|c| (live[i + c] as i16 - prev[i + c] as i16).unsigned_abs())
+                            .max()
+                            .unwrap() as f32;
+                        prev[i..i + 3].copy_from_slice(&live[i..i + 3]);
+                        still[x] = if moved > p.motion {
+                            0
                         } else {
-                            0.0
+                            still[x].saturating_add(1)
                         };
-                        mem[i] += k * (r - mem[i]);
-                        mem[i + 1] += k * (g - mem[i + 1]);
-                        mem[i + 2] += k * (b - mem[i + 2]);
+                        hold[x] = grown[x].max(hold[x] * p.hold_decay);
+                        state[x] = if alpha[x] > 0.5 {
+                            debug::PERSON
+                        } else {
+                            debug::HELD
+                        };
+                        if hold[x] < 0.05 {
+                            let d = (r - mem[i])
+                                .abs()
+                                .max((g - mem[i + 1]).abs())
+                                .max((b - mem[i + 2]).abs());
+                            let k = if d > p.ink_diff {
+                                if still[x] >= p.settle {
+                                    state[x] = debug::ACCEPTING;
+                                    p.rate_fast
+                                } else {
+                                    state[x] = debug::WAITING;
+                                    0.0
+                                }
+                            } else {
+                                state[x] = if d > debug::CREEP_DIFF {
+                                    debug::CREEPING
+                                } else {
+                                    debug::BOARD
+                                };
+                                if still[x] >= p.settle_slow {
+                                    p.rate_slow
+                                } else {
+                                    0.0
+                                }
+                            };
+                            mem[i] += k * (r - mem[i]);
+                            mem[i + 1] += k * (g - mem[i + 1]);
+                            mem[i + 2] += k * (b - mem[i + 2]);
+                        }
+                        out[i] = mem[i].round() as u8;
+                        out[i + 1] = mem[i + 1].round() as u8;
+                        out[i + 2] = mem[i + 2].round() as u8;
                     }
-                    out[i] = mem[i].round() as u8;
-                    out[i + 1] = mem[i + 1].round() as u8;
-                    out[i + 2] = mem[i + 2].round() as u8;
-                }
-            });
+                },
+            );
     }
 }
 
@@ -524,6 +626,29 @@ mod tests {
         }
         let t = arrived.expect("chalk never appeared");
         assert!(t <= 15, "chalk took {t} frames (> 0.5 s at 30 fps)");
+    }
+
+    #[test]
+    fn debug_state_follows_new_chalk_from_waiting_to_accepted() {
+        let mut g = blind_ghost();
+        let mut out = Rgb::new(120, 80);
+        g.composite(&frame(|_, _| None), false, &mut out);
+        let chalked =
+            frame(|x, y| ((50..70).contains(&x) && (38..42).contains(&y)).then_some(CHALK));
+        let at = |g: &Ghost| g.state[40 * 120 + 60];
+        g.composite(&chalked, false, &mut out);
+        assert_eq!(at(&g), debug::WAITING);
+        assert_eq!(g.state[10 * 120 + 10], debug::BOARD);
+        let mut seen_accepting = false;
+        for _ in 0..30 {
+            g.composite(&chalked, false, &mut out);
+            seen_accepting |= at(&g) == debug::ACCEPTING;
+        }
+        assert!(seen_accepting, "chalk never shown as going in");
+        assert_eq!(at(&g), debug::BOARD, "settled chalk should read as board");
+        let shares = g.debug_shares();
+        assert!((shares.iter().sum::<f32>() - 1.0).abs() < 1e-4);
+        g.draw_debug(&mut out);
     }
 
     #[test]

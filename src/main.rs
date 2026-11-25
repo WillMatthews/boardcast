@@ -32,7 +32,10 @@ use camera::{Camera, Focus, Sink, SinkIo};
 use image::{ResampleMap, Rgb, rgb_to_yuyv};
 
 #[derive(Parser)]
-#[command(about = "Blackboard virtual camera: a deskewed, cleaned-up board with you as a see-through ghost", version)]
+#[command(
+    about = "Blackboard virtual camera: a deskewed, cleaned-up board with you as a see-through ghost",
+    version
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Option<Cmd>,
@@ -103,6 +106,9 @@ enum Cmd {
         ratio: f32,
         #[arg(long, default_value_t = 4)]
         threads: usize,
+        /// Run on the CPU even in a CUDA build.
+        #[arg(long)]
+        cpu: bool,
         /// Use a still JPEG instead of the camera.
         #[arg(long)]
         image: Option<PathBuf>,
@@ -176,9 +182,13 @@ struct RunArgs {
     /// CPU threads for segmentation.
     #[arg(long, default_value_t = 2)]
     seg_threads: usize,
-    /// Maximum segmentation rate. Higher follows you more closely and costs more CPU.
-    #[arg(long, default_value_t = 10.0)]
-    seg_fps: f32,
+    /// Segment on the CPU even in a CUDA build (`--features cuda`), which otherwise uses the GPU.
+    #[arg(long)]
+    seg_cpu: bool,
+    /// Maximum segmentation rate (default 10 on the CPU, every camera frame on the GPU).
+    /// Higher follows you more closely and costs more CPU.
+    #[arg(long)]
+    seg_fps: Option<f32>,
     /// Threads for the per-frame image work (warp, ghost, colour conversion).
     #[arg(long, default_value_t = 4)]
     threads: usize,
@@ -389,6 +399,7 @@ fn main() -> Result<()> {
         res,
         ratio,
         threads,
+        cpu,
         image,
     }) = &cli.cmd
     {
@@ -405,11 +416,12 @@ fn main() -> Result<()> {
                 })
             }
             None => {
-                let mut cam = Camera::open(&cli.common.cam, fw, fh, focus_of(&cli.common, file.focus)?)?;
+                let mut cam =
+                    Camera::open(&cli.common.cam, fw, fh, focus_of(&cli.common, file.focus)?)?;
                 Box::new(move |out: &mut Rgb| cam.next_into(out))
             }
         };
-        return seg_bench(&mut *source, (fw, fh), dir, *res, *ratio, *threads);
+        return seg_bench(&mut *source, (fw, fh), dir, *res, *ratio, *threads, !*cpu);
     }
     // Light first, so the camera's auto-exposure settles on the lit board (calibration and focus need it too).
     // Dropped (light off) on any exit.
@@ -749,9 +761,10 @@ fn seg_bench(
     (w, h): (usize, usize),
     ratio: f32,
     threads: usize,
+    gpu: bool,
 ) -> Result<()> {
     let model = paths::model("rvm_mobilenetv3_fp32.onnx");
-    let mut m = segment::Matting::new(&model, w, h, ratio, threads)?;
+    let mut m = segment::Matting::new(&model, w, h, ratio, threads, gpu)?;
     let down = ResampleMap::scale(fw, fh, w, h);
     let (mut frame, mut small) = (Rgb::new(fw, fh), Rgb::new(w, h));
     let mut alpha = vec![0f32; w * h];
@@ -767,7 +780,12 @@ fn seg_bench(
     }
     times.sort_by(f64::total_cmp);
     eprintln!(
-        "{w}x{h} ratio {ratio} threads {threads}: median {:.1} ms, p90 {:.1} ms",
+        "{w}x{h} ratio {ratio} {}: median {:.1} ms, p90 {:.1} ms",
+        if m.gpu {
+            "GPU".to_string()
+        } else {
+            format!("threads {threads}")
+        },
         times[times.len() / 2],
         times[times.len() * 9 / 10]
     );
@@ -836,6 +854,7 @@ fn run(
             (sw, sh),
             args.seg_ratio,
             args.seg_threads,
+            !args.seg_cpu,
             args.seg_fps,
             Some(args.pose_model.as_path()).filter(|p| p.exists()),
         )?;
@@ -852,7 +871,8 @@ fn run(
             ..Default::default()
         };
         say!(
-            "ghost mode: segmenting at {sw}x{sh}, opacity {}",
+            "ghost mode: segmenting at {sw}x{sh} on the {}, opacity {}",
+            if seg.gpu { "GPU" } else { "CPU" },
             args.ghost_opacity
         );
         Some((
@@ -893,6 +913,8 @@ fn run(
     let mut enhancer = enhance::Enhancer::new(args.look, board.w, board.h);
     let mut enhanced = Rgb::new(board.w, board.h);
     let mut last_enhance = Instant::now() - Duration::from_secs(1);
+    // `d`: show what the board memory is doing at each pixel instead of the board.
+    let mut debug_view = false;
     let mut pip = pip::Pip::new(args.pip_size, args.pip_corner, args.pip && ghost.is_some());
     let board_watched = camera::watch_openers(&args.board);
     let started = Instant::now();
@@ -1052,6 +1074,19 @@ fn run(
                         None => say!("can't adjust focus: the camera won't say where it is"),
                     }
                 }
+                b'd' if ghost.is_some() => {
+                    debug_view = !debug_view;
+                    say!(
+                        "debug view {}",
+                        if debug_view {
+                            "on: blue me, magenta held, red→yellow waiting to settle, green going in, \
+                             cyan creeping in slowly"
+                        } else {
+                            "off"
+                        }
+                    );
+                }
+                b'd' => say!("the debug view shows the board memory, which needs ghost mode"),
                 b'o' => {
                     pip.corner = pip.corner.next();
                     say!("picture-in-picture: {:?}", pip.corner);
@@ -1071,31 +1106,36 @@ fn run(
             Some((seg, g, out)) => {
                 seg.submit(&frame);
                 g.step(&board, seg, out);
-                // The memory changes slowly (half-second fades), so ~10 Hz enhancement looks the same and
-                // costs a third as much at 30 fps; I'm drawn over it every frame.
-                if enhancer.look == enhance::Look::Plain
-                    || last_enhance.elapsed() >= Duration::from_millis(90)
-                {
-                    enhancer.apply(out, &mut enhanced);
-                    last_enhance = Instant::now();
+                if debug_view {
+                    g.draw_debug(out);
+                    &*out
+                } else {
+                    // The memory changes slowly (half-second fades), so ~10 Hz enhancement looks the same and
+                    // costs a third as much at 30 fps; I'm drawn over it every frame.
+                    if enhancer.look == enhance::Look::Plain
+                        || last_enhance.elapsed() >= Duration::from_millis(90)
+                    {
+                        enhancer.apply(out, &mut enhanced);
+                        last_enhance = Instant::now();
+                    }
+                    g.overlay(&enhanced, &board, out);
+                    seg.set_pose(pip.on);
+                    let up = image::upright_size((cam.w, cam.h), cfg.rotate);
+                    let person = seg.person();
+                    if let Some((version, person)) = person {
+                        pip.track_head(version, person.head, (seg.w, seg.h), up);
+                    }
+                    let (m, mw, mh, version) = g.matte();
+                    pip.track(
+                        m,
+                        mw,
+                        mh,
+                        version,
+                        image::upright_size((cam.w, cam.h), cfg.rotate),
+                    );
+                    pip.draw(&frame, cfg.rotate, out);
+                    &*out
                 }
-                g.overlay(&enhanced, &board, out);
-                seg.set_pose(pip.on);
-                let up = image::upright_size((cam.w, cam.h), cfg.rotate);
-                let person = seg.person();
-                if let Some((version, person)) = person {
-                    pip.track_head(version, person.head, (seg.w, seg.h), up);
-                }
-                let (m, mw, mh, version) = g.matte();
-                pip.track(
-                    m,
-                    mw,
-                    mh,
-                    version,
-                    image::upright_size((cam.w, cam.h), cfg.rotate),
-                );
-                pip.draw(&frame, cfg.rotate, out);
-                &*out
             }
             None => {
                 enhancer.apply(&board, &mut enhanced);
@@ -1126,6 +1166,10 @@ fn run(
                 raw: raw_out.as_ref().map(|(s, _, _, w)| feed(s, w)),
                 look: enhancer.look,
                 ghost: ghost.as_ref().map(|(_, g, _)| g.opacity()),
+                debug: ghost
+                    .as_ref()
+                    .filter(|_| debug_view)
+                    .map(|(_, g, _)| g.debug_shares()),
                 pip: ghost.as_ref().map(|_| pip.describe()),
                 light: light.as_ref().map(|l| l.describe()),
                 sharpness,

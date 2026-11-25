@@ -18,5 +18,13 @@ pub fn config(name: &str) -> PathBuf {
 
 /// A model file (see scripts/fetch-model.sh and scripts/fetch-pose-model.sh).
 pub fn model(name: &str) -> PathBuf {
-    xdg("XDG_DATA_HOME", ".local/share").join("models").join(name)
+    xdg("XDG_DATA_HOME", ".local/share")
+        .join("models")
+        .join(name)
+}
+
+/// The CUDA + cuDNN libraries for a `--features cuda` build (see scripts/fetch-cuda.sh).
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+pub fn cuda() -> PathBuf {
+    xdg("XDG_DATA_HOME", ".local/share").join("cuda")
 }

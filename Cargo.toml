@@ -23,3 +23,7 @@ serde_json = "1.0.154"
 ureq = "3.5.2"
 v4l = "0.14.0"
 zune-jpeg = "0.5.15"
+
+[features]
+# Run segmentation on an NVIDIA GPU through ONNX Runtime's CUDA provider (needs CUDA 13 + cuDNN 9: scripts/fetch-cuda.sh).
+cuda = ["ort/cuda", "ort/preload-dylibs"]

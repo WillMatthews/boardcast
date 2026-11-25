@@ -6,7 +6,7 @@
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-2F4A3A.svg"></a>
   <img alt="Platform: Linux" src="https://img.shields.io/badge/platform-Linux-2F4A3A.svg">
   <img alt="Written in Rust" src="https://img.shields.io/badge/rust-2024-2F4A3A.svg">
-  <img alt="No GPU needed" src="https://img.shields.io/badge/GPU-not%20needed-E5484D.svg">
+  <img alt="GPU optional" src="https://img.shields.io/badge/GPU-optional-E5484D.svg">
 </p>
 
 # boardcast
@@ -70,7 +70,8 @@ flowchart LR
   a lighter frame (for example a green chalkboard in an aluminium frame).
 - **Rust** (edition 2024; install with [rustup](https://rustup.rs)) and `curl`. The optional pose model also needs
   [uv](https://docs.astral.sh/uv/).
-- A few CPU cores: ghost mode uses about 2–2.5 cores at 15 fps. No GPU needed.
+- A few CPU cores: ghost mode uses about 2–2.5 cores at 15 fps. No GPU needed, but an NVIDIA GPU lets it segment
+  every frame instead of 10 a second (see [segmenting on the GPU](#segmenting-on-an-nvidia-gpu)).
 
 **Tested with** an Anker PowerConf C200 (2560×1440 MJPEG, mounted on its side) and a green chalkboard in an aluminium
 frame, on Ubuntu with v4l2loopback 0.12.7. Other webcams and boards should work; reports are welcome in the issues.
@@ -96,6 +97,22 @@ scripts/loopback.sh
 scripts/fetch-model.sh       # person segmentation (Robust Video Matting, ~15 MB); needed for ghost mode
 scripts/fetch-pose-model.sh  # optional: head finding for the picture-in-picture (needs uv)
 ```
+
+#### Segmenting on an NVIDIA GPU
+
+Optional. On the CPU, segmentation takes ~45 ms a frame, so the ghost's matte updates 10 times a second. With CUDA it
+takes ~8 ms (RTX 2060), so it updates on every camera frame. You need an NVIDIA driver for CUDA 13 (r580 or later;
+see `nvidia-smi`). Then:
+
+```sh
+scripts/fetch-cuda.sh   # CUDA 13 + cuDNN 9 runtime libraries from NVIDIA's PyPI wheels (~1 GB download, 1.7 GB unpacked)
+cargo build --release --features cuda
+# ONNX Runtime's CUDA provider libraries must sit next to the binary:
+install -m755 target/release/boardcast target/release/libonnxruntime_providers_{shared,cuda}.so ~/.cargo/bin/
+```
+
+The libraries go to `~/.local/share/boardcast/cuda`. When the GPU can't be used, boardcast says why and segments on
+the CPU. `--seg-cpu` forces the CPU, and `--seg-fps` still caps the rate.
 
 **4. Set up the camera.** With the board in view:
 
@@ -151,6 +168,7 @@ look and ghost settings, focus and sharpness, board tracking, frame rate and CPU
 | `g` | step how much of you is shown: hidden → ghost 0.1 → 0.25 → 0.5 → opaque |
 | `l` | cycle the look: plain → natural → paper |
 | `p` | picture-in-picture on / off; `o` moves it to the next corner |
+| `d` | debug view of the board memory (see below) |
 | `f` | switch between the board's focus and autofocus |
 | `,` / `.` | move the board focus nearer / further (saved a couple of seconds after you stop) |
 | `b` | board light on / off; `-` / `=` dim / brighten; `k` steps the colour temperature |
@@ -163,6 +181,20 @@ look and ghost settings, focus and sharpness, board tracking, frame rate and CPU
 | `natural` (default) | lighting evened out, chalk boosted, the board's colours kept |
 | `paper` | dark ink on white, chalk only (sticky notes and chalk-dust haze become paper); clearest in poor light |
 | `plain` | the board as the camera sees it |
+
+### Debug view
+
+`d` swaps the board feed for a map of what the board memory is doing at each pixel, over a dim grey copy of the
+memory. The status display shows what share of the board is in each state.
+
+| Colour | What |
+|---|---|
+| blue | you (the segmentation matte); frozen |
+| magenta | held: the grown matte around you, and its hold after you move, fading as it decays; frozen |
+| red → yellow | a big change (new chalk, erasing, a shadow) waiting for the pixel to keep still; yellow is nearly there |
+| green | a big change going into memory now |
+| cyan | a small change creeping in at the slow rate (faint chalk, a soft shadow edge) |
+| none | matches the memory |
 
 ### Common options
 

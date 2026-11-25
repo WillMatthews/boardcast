@@ -44,24 +44,14 @@ fn ort_err<E: std::fmt::Display>(e: E) -> anyhow::Error {
 
 impl Pose {
     /// `w` x `h`: the size of the frames that will be passed to `run` (resized to the model's input if different).
-    pub fn new(model: &Path, w: usize, h: usize, threads: usize) -> Result<Self> {
+    pub fn new(model: &Path, w: usize, h: usize, threads: usize, gpu: bool) -> Result<Self> {
         let env = crate::segment::ort_env()?;
-        let session = Session::builder(&env)
-            .map_err(ort_err)?
-            .with_intra_threads(threads)
-            .map_err(ort_err)?
-            .with_intra_op_spinning(false)
-            .map_err(ort_err)?
-            .with_inter_op_spinning(false)
-            .map_err(ort_err)?
-            .commit_from_file(model)
-            .map_err(ort_err)
-            .with_context(|| {
-                format!(
-                    "loading {} (run scripts/fetch-pose-model.sh)",
-                    model.display()
-                )
-            })?;
+        let (session, _) = crate::segment::load(&env, model, threads, gpu).with_context(|| {
+            format!(
+                "loading {} (run scripts/fetch-pose-model.sh)",
+                model.display()
+            )
+        })?;
         let resize = ((w, h) != (W, H)).then(|| (ResampleMap::scale(w, h, W, H), Rgb::new(W, H)));
         Ok(Pose {
             session,
